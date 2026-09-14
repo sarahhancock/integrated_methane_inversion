@@ -360,11 +360,11 @@ def build_weighted_correlation(rows, totals_by_element, group_rho):
     return np.clip(covariance, 0.0, 1.0)
 
 
-def build_two_component_covariance(
-    rows, neff_sum, neff_sumsq, uncertainty_rows, totals_by_element,
-    prior_sigma, grid_national_ratio=2.5, min_uncertainty=0.30,
+def two_component_absolute(
+    rows, neff_sum, neff_sumsq, uncertainty_rows, n_elements,
+    grid_national_ratio=2.5, min_uncertainty=0.30,
 ):
-    """Exact two-component prior error covariance (returns correlation C and per-element sigma).
+    """Two-component anthropogenic prior error covariance in ABSOLUTE emission^2 units.
 
     Per (country, sector) group the within-country prior covariance is
         national rank-1 :  snat^2 * E_i * E_j
@@ -372,17 +372,13 @@ def build_two_component_covariance(
     with ratio_i = sqrt(1 + (R01^2 - 1) / n_eff_i) the grid:national error ratio
     (n_eff_i = effective number of independent native cells in the element), and
         snat = u_BTR / sqrt(1 + Q),   Q = sum_i (ratio_i^2 - 1) E_i^2 / E_c^2,
-    chosen so the national aggregate uncertainty equals u_BTR EXACTLY.  Sector contributions
-    are summed (sectors are independent), the absolute covariance is converted to a
-    scale-factor covariance by dividing by the total per-element emission, and decomposed
-    exactly as Sa_rel = sigma * C * sigma with C unit-diagonal -- so it fits the standard
-    (correlation, sigma_scale) output contract with no approximation.  Elements with no
-    inventory emission fall back to the uniform prior_sigma, uncorrelated.
-
-    Returns (C, sigma, diagnostics).
+    chosen so the national aggregate uncertainty equals u_BTR EXACTLY.  Sector
+    contributions are summed (sectors are independent).  Only groups that appear in
+    uncertainty_rows contribute; every other element stays zero here (its variance is
+    supplied by another block, e.g. the wetland ensemble, or the uniform fallback in
+    decompose_relative_covariance).  Returns (Sa_abs, diagnostics).
     """
-    n = len(totals_by_element)
-    Sa_abs = np.zeros((n, n), dtype=np.float64)
+    Sa_abs = np.zeros((n_elements, n_elements), dtype=np.float64)
 
     emissions_by_group = defaultdict(lambda: defaultdict(float))
     for (country_id, sector, pos), value in rows.items():
@@ -420,17 +416,39 @@ def build_two_component_covariance(
             "relative_uncertainty": u, "achieved_relative_uncertainty": achieved,
             "n_elements": int(positions.size), "median_ratio": float(np.median(np.sqrt(1.0 + r2))),
         })
+    return Sa_abs, diagnostics
 
+
+def decompose_relative_covariance(Sa_abs, totals_by_element, prior_sigma):
+    """Convert an ABSOLUTE emission^2 covariance to a scale-factor covariance and split it
+    exactly into a unit-diagonal correlation C and a per-element sigma:
+        Sa_rel = Sa_abs / outer(E_total, E_total),   Sa_rel = sigma * C * sigma.
+    Elements with zero emission (hence zero variance) fall back to the uniform
+    prior_sigma, uncorrelated.  Returns (C, sigma)."""
     total_emis = np.asarray(totals_by_element, dtype=np.float64)
     total_emis_floored = np.where(total_emis > 0, total_emis, 1.0)
     Sa_rel = Sa_abs / np.outer(total_emis_floored, total_emis_floored)   # scale-factor covariance
     sigma = np.sqrt(np.clip(np.diag(Sa_rel), 0.0, None))
-    # exact decomposition into unit-diagonal correlation + per-element sigma
     sig_safe = np.where(sigma > 0, sigma, 1.0)
     C = Sa_rel / np.outer(sig_safe, sig_safe)
     np.fill_diagonal(C, 1.0)
-    # elements with no inventory emission: fall back to the uniform prior_sigma, uncorrelated
     sigma_out = np.where(sigma > 0, sigma, prior_sigma)
+    return C, sigma_out
+
+
+def build_two_component_covariance(
+    rows, neff_sum, neff_sumsq, uncertainty_rows, totals_by_element,
+    prior_sigma, grid_national_ratio=2.5, min_uncertainty=0.30,
+):
+    """Exact two-component prior error covariance (returns correlation C, per-element sigma,
+    diagnostics).  Thin wrapper: assemble the absolute covariance (two_component_absolute)
+    then decompose it exactly into (C, sigma) (decompose_relative_covariance).  Fits the
+    standard (correlation, sigma_scale) output contract with no approximation."""
+    n = len(totals_by_element)
+    Sa_abs, diagnostics = two_component_absolute(
+        rows, neff_sum, neff_sumsq, uncertainty_rows, n, grid_national_ratio, min_uncertainty
+    )
+    C, sigma_out = decompose_relative_covariance(Sa_abs, totals_by_element, prior_sigma)
     return C, sigma_out, diagnostics
 
 

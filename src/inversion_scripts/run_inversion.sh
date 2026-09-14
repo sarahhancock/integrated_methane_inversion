@@ -177,6 +177,8 @@ if "$OffDiagonalPriorCov"; then
     PriorCovarianceMethod="${PriorCovarianceMethod:-length_scale}"
     if [[ "$PriorCovarianceMethod" == "national_inventory" ]]; then
         python build_national_inventory_prior_covariance.py $StateVectorFile $PriorEmisDir $configPath $StartDate $EndDate $nBufferClusters; wait
+    elif [[ "$PriorCovarianceMethod" == "sector_ensemble" ]]; then
+        python build_sector_ensemble_prior_covariance.py $StateVectorFile $PriorEmisDir $configPath $StartDate $EndDate $nBufferClusters; wait
     else
         python build_full_prior_covariance.py $StateVectorFile $PriorEmisDir $LengthScalePriorCov $StartDate $EndDate $nBufferClusters; wait
     fi

@@ -146,6 +146,21 @@ LengthScalePriorCov: 25  ## in km, only used if OffDiagonalPriorCov is true
 ## Or use a countries shapefile directly:
 ##   NationalPriorCountryShapefile: "/path/to/countries.shp"
 ##   NationalPriorCountryNameColumn: "NAME"
+##   PriorCovarianceMethod: "sector_ensemble"    # data-driven sector covariance (full method)
+## For PriorCovarianceMethod: "sector_ensemble", Sa is the sum of three per-sector blocks:
+##   (1) anthropogenic sectors -> two-component national covariance (uses the NationalPrior*
+##       keys above: NationalPriorUncertaintyFile + country mask, GridNationalRatio, MinUncertainty);
+##   (2) Wetlands -> ensemble covariance diag(sigma*E) exp(-d/L) diag(sigma*E) from a wetland
+##       model ensemble (per-cell relative error + variogram length); enable by setting:
+##         SectorEnsembleWetlandFile: "/path/to/wetland_ensemble_cov.npz"  # per-cell rel error on lat/lon (+ optional L_km)
+##         SectorEnsembleWetlandVar: "rel"                # variable name (default "rel"); 3-D (month,lat,lon) is annual-averaged
+##       # SectorEnsembleWetlandLengthKm: 161             # Default 161 km from Hancock South America work (else read L_km from file)
+##   (3) remaining natural sectors + OtherAnth -> a generic correlated block
+##       diag(sigma*E) [exp(-d/L) o cosine-similarity] diag(sigma*E):
+##         SectorEnsembleGenericSigma: 0.5                # relative error (Yu et al. 2021)
+##         SectorEnsembleGenericLengthKm: 200            # km (Yu et al. 2021)
+##   # SectorEnsembleSigmaFloor: 0.15 ; SectorEnsembleSigmaCap: 2.0   # per-cell wetland sigma clip
+##   # SectorEnsembleTwoComponentSectors / SectorEnsembleGenericSectors override the sector partition.
 
 ## Observational error covariance with off-diagonal spatial + temporal correlations.
 ## Set OffDiagonalObsCov: true to apply the residual-error method (REM) off-diagonal So:

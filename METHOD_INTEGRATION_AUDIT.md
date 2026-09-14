@@ -135,3 +135,38 @@ overpasses; K scaled by 1e9 as the loaders do) via `solve_inversion_from_k` (`sc
 - **softplus + EXACT two-exponential off-diag So** (day-blocked block-Thomas): applied exactly, positive (min 0.75),
   Jo/(m-DOFS) drops 0.76 -> 0.43 (correlated obs errors correctly down-weighted).
 (1 week is the size cached; a fresh 1-month would require re-running the GC Jacobian simulations.)
+
+## Data-driven sector-ensemble prior covariance — WETCOV + generic natural block (2026-09-14)
+
+Added the wetland ensemble covariance (and the generic natural block) so the branch can build the
+FULL production prior error covariance, not just the two-component anthropogenic term.
+
+- **New method** `PriorCovarianceMethod: sector_ensemble` (`run_inversion.sh`, dispatched to the new
+  `src/inversion_scripts/build_sector_ensemble_prior_covariance.py`; added to the inversion copy list in
+  `src/components/inversion_component/inversion.sh`). It sums three per-sector blocks in ABSOLUTE emission^2
+  units and decomposes the result exactly into the standard (unit-diagonal correlation, per-element sigma)
+  contract — so `invert.py` and the on-disk `prior_norm_error_covariance.npz` format are UNCHANGED:
+  1. **Anthropogenic** -> two-component national covariance (reuses `two_component_absolute`, the refactored
+     core of `build_two_component_covariance`; national aggregate = u_BTR exactly, R01/floor configurable).
+  2. **Wetlands** -> ensemble covariance `diag(sigma_i E_i) exp(-d_ij/L) diag(sigma_j E_j)` with a per-cell
+     relative error sigma_i from a wetland model ensemble (`SectorEnsembleWetlandFile`, e.g. `sa_wetland_cov.npz`:
+     3-product spread `rel` on a lat/lon grid + variogram length `L_km=161`) mapped nearest-cell onto elements,
+     clipped `[SectorEnsembleSigmaFloor 0.15, SectorEnsembleSigmaCap 2.0]`.
+  3. **Remaining naturals + OtherAnth** -> generic block `diag(sigma E)[exp(-d/L) o cosine-similarity]diag(sigma E)`,
+     sigma=0.5, L=200 km (Yu et al. 2021).
+- **Refactor (behaviour-preserving):** `build_national_inventory_prior_covariance.py` now exposes
+  `two_component_absolute()` (absolute-covariance assembly) and `decompose_relative_covariance()` (the exact
+  (C, sigma) split); `build_two_component_covariance()` is a thin wrapper calling both. Regression: the
+  national two-component builder reproduces its prior output (national aggregate / u_BTR median = 1.0000, PSD).
+- **Config** (`config.yml`) documents the new `sector_ensemble` method + `SectorEnsembleWetland*` /
+  `SectorEnsembleGeneric*` keys with SA defaults. New keys are consumed via `config.get()` (unregistered, like
+  `NationalPriorTwoComponent`); `sanitize_input_yaml.py` untouched (unknown keys pass through).
+- **Validated end-to-end** on the real SA run (`imi_south_america_trends_gcloop` StateVector + prior emis,
+  2019-01-01->07, Saunois anthro defaults + `sa_wetland_cov.npz`): builder writes a (1300,1300) unit-diagonal,
+  symmetric, PSD (min-eig 0.039) correlation + `sigma_scale` [0.17,1.75]; wetland ensemble L=161 km applied to
+  1272 elements; ~408k off-diagonal |C|>0.05 (real spatial structure, not diagonal). Contract identical to the
+  other builders -> no `invert.py` change.
+- **Note (attribution vs inversion):** the anthropogenic inter-inventory ensemble (ANTHCOV) is NOT added here
+  because in the production two-component (TCEQ4) configuration its spread does not set the inversion Sa
+  magnitude (the BTR two-component does); ANTHCOV feeds sector ATTRIBUTION only. WETCOV is the piece that
+  changes the inversion Sa, and it is now included.
