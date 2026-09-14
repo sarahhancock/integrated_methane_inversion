@@ -8,6 +8,7 @@ import re
 import os
 import datetime
 import gc
+import xarray as xr
 from src.inversion_scripts.utils import save_obj
 from src.utilities.config_utils import load_config
 from src.inversion_scripts.operators.satellite_operator import (
@@ -69,6 +70,55 @@ def apply_operator(operator, params, config):
         raise ValueError("Error: invalid operator selected.")
 
 
+def file_has_usable_obs(
+    filename,
+    satellite_product,
+    gc_startdate,
+    gc_enddate,
+    xlim,
+    ylim,
+    use_water_obs,
+):
+    """Cheap prefilter to skip satellite files with no valid in-domain observations."""
+    if satellite_product != "BlendedTROPOMI":
+        return True
+
+    try:
+        with xr.open_dataset(filename) as ds:
+            longitude = ds["longitude"].values
+            latitude = ds["latitude"].values
+            time_utc = np.array(
+                [d.replace("Z", "") for d in ds["time_utc"].values]
+            ).astype("datetime64[ns]")
+            longitude_bounds = ds["longitude_bounds"].values
+            surface_classification_raw = ds["surface_classification"].values.astype("uint8")
+            surface_classification = (surface_classification_raw & 0x03).astype(int)
+            surface_classification_0xF9 = (surface_classification_raw & 0xF9).astype(int)
+            chi_square_swir = ds["chi_square_SWIR"].values
+
+        valid_idx = (
+            (longitude > xlim[0])
+            & (longitude < xlim[1])
+            & (latitude > ylim[0])
+            & (latitude < ylim[1])
+            & (time_utc >= gc_startdate)
+            & (time_utc <= gc_enddate)
+            & (longitude_bounds.ptp(axis=1) < 100)
+            & ~(
+                (surface_classification == 3)
+                | ((surface_classification == 2) & (chi_square_swir > 20000))
+            )
+            & ~(surface_classification_0xF9 == 184)
+            & (latitude > -60)
+        )
+        if not use_water_obs:
+            valid_idx = valid_idx & (surface_classification != 1)
+        return bool(np.any(valid_idx))
+    except Exception as exc:
+        print(f"Prefilter failed for {filename}: {exc}. Processing file anyway.", flush=True)
+        return True
+
+
 if __name__ == "__main__":
 
     workdir = sys.argv[1]
@@ -98,6 +148,7 @@ if __name__ == "__main__":
         build_jacobian = True
     else:
         build_jacobian = False
+    obs_only_cache = bool(config.get("ObservationOnlyJacobianCache", False))
     if isPost.lower() == "false":  # if sampling prior simulation
         gc_cache = f"{workdir}/data_geoschem"
         outputdir = f"{workdir}/data_converted"
@@ -124,6 +175,9 @@ if __name__ == "__main__":
     )
     print("Start:", gc_startdate)
     print("End:", gc_enddate)
+    default_jobs = min(8, os.cpu_count() or 1)
+    n_parallel_jobs = int(config.get("InversionParallelJobs", default_jobs))
+    n_parallel_jobs = max(1, n_parallel_jobs)
 
     # Get satellite data filenames for the desired date range
     allfiles = glob.glob(f"{satellite_cache}/*.nc")
@@ -137,7 +191,30 @@ if __name__ == "__main__":
         if (strdate >= gc_startdate) and (strdate <= gc_enddate):
             sat_files.append(filename)
     sat_files.sort()
-    print("Found", len(sat_files), "satellite data files.")
+    print("Found", len(sat_files), "satellite data files before prefilter.")
+
+    filtered_sat_files = [
+        filename
+        for filename in sat_files
+        if file_has_usable_obs(
+            filename,
+            satellite_product,
+            gc_startdate,
+            gc_enddate,
+            xlim,
+            ylim,
+            use_water_obs.lower() == "true",
+        )
+    ]
+    skipped_prefilter = len(sat_files) - len(filtered_sat_files)
+    sat_files = filtered_sat_files
+    print(
+        "Keeping",
+        len(sat_files),
+        "satellite data files after prefilter; skipped",
+        skipped_prefilter,
+        "with no usable observations.",
+    )
 
     # Map GEOS-Chem to satellite observation space
     # Also return Jacobian matrix if build_jacobian=True
@@ -173,24 +250,26 @@ if __name__ == "__main__":
             )
 
             # we also save out the unaveraged satellite operator for visualization purposes
-            viz_output = apply_operator(
-                "satellite",
-                {
-                    "filename": filename,
-                    "species" : species,
-                    "satellite_product": satellite_product,
-                    "n_elements": n_elements,
-                    "gc_startdate": gc_startdate,
-                    "gc_enddate": gc_enddate,
-                    "xlim": xlim,
-                    "ylim": ylim,
-                    "gc_cache": gc_cache,
-                    "build_jacobian": False,
-                    "period_i": period_i,
-                    "use_water_obs": use_water_obs,
-                },
-                config,
-            )
+            viz_output = None
+            if not obs_only_cache:
+                viz_output = apply_operator(
+                    "satellite",
+                    {
+                        "filename": filename,
+                        "species" : species,
+                        "satellite_product": satellite_product,
+                        "n_elements": n_elements,
+                        "gc_startdate": gc_startdate,
+                        "gc_enddate": gc_enddate,
+                        "xlim": xlim,
+                        "ylim": ylim,
+                        "gc_cache": gc_cache,
+                        "build_jacobian": False,
+                        "period_i": period_i,
+                        "use_water_obs": use_water_obs,
+                    },
+                    config,
+                )
 
             if output == None:
                 return 0
@@ -200,7 +279,8 @@ if __name__ == "__main__":
         if output["obs_GC"].shape[0] > 0:
             print("Saving .pkl file")
             save_obj(output, f"{outputdir}/{date}_GCtoSatellite.pkl")
-            save_obj(viz_output, f"{vizdir}/{date}_GCtoSatellite.pkl")
+            if viz_output is not None:
+                save_obj(viz_output, f"{vizdir}/{date}_GCtoSatellite.pkl")
 
         #Clean up to reduce memory use
         del output, viz_output
@@ -208,5 +288,7 @@ if __name__ == "__main__":
 
         return 0
 
-    results = Parallel(n_jobs=-1)(delayed(process)(filename) for filename in sat_files)
+    results = Parallel(n_jobs=n_parallel_jobs)(
+        delayed(process)(filename) for filename in sat_files
+    )
     print(f"Wrote files to {outputdir}")

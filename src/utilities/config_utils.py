@@ -108,7 +108,7 @@ def _expand_env_vars(value):
     return value
 
 
-def load_config(config_path, validate_hierarchy=True, normalize=True, expand_env=True):
+def load_config(config_path, validate_hierarchy=False, normalize=True, expand_env=True):
     """
     Canonical IMI config loader used by runtime scripts.
 

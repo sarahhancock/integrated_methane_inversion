@@ -35,7 +35,14 @@ def calc_so(obs_error, obs_GC):
 from functools import partial
 print = partial(print, flush = True)
 
-def merge_partial_k(satdat_dir, lat_bounds, lon_bounds, obs_errs, precomp_K):
+
+def save_npz_unless_preserving_so(path, preserve_existing_so, **kwargs):
+    if preserve_existing_so and os.path.exists(path):
+        print(f"Preserving existing So file {path}")
+        return
+    np.savez(path, **kwargs)
+
+def merge_partial_k(satdat_dir, lat_bounds, lon_bounds, obs_errs, precomp_K, allow_missing_k=False):
     """
     Description:
         This function is used to generate the full jacobian matrix (K), observations (y),
@@ -67,6 +74,10 @@ def merge_partial_k(satdat_dir, lat_bounds, lon_bounds, obs_errs, precomp_K):
         so_dict[key] = [None for i in range(len(files))]
     satellite_list = [None for i in range(len(files))]
     geos_prior_list = [None for i in range(len(files))]
+    lon_list = [None for i in range(len(files))]
+    lat_list = [None for i in range(len(files))]
+    observation_count_list = [None for i in range(len(files))]
+    dates_list = [None for i in range(len(files))]   # YYYYMMDD per super-ob (overpass date)
     K_list = [None for i in range(len(files))]
     
     # If using precomputed jacobian, get the mappings to reference jacobian files
@@ -97,8 +108,19 @@ def merge_partial_k(satdat_dir, lat_bounds, lon_bounds, obs_errs, precomp_K):
         obs_GC = obs_GC[ind[0], :]  # satellite and GEOS-Chem data within bounds
 
         # concatenate full jacobian, obs, so, and prior
-        satellite_list[i] = obs_GC[:, 0]
-        geos_prior_list[i] = obs_GC[:, 1]
+        satellite_list[i] = np.asarray(obs_GC[:, 0], dtype=np.float32)
+        geos_prior_list[i] = np.asarray(obs_GC[:, 1], dtype=np.float32)
+        lon_list[i] = np.asarray(obs_GC[:, 2], dtype=np.float32)
+        lat_list[i] = np.asarray(obs_GC[:, 3], dtype=np.float32)
+        observation_count_list[i] = np.asarray(obs_GC[:, 4], dtype=np.float32)
+        # Overpass date (YYYYMMDD) parsed from the pkl filename, one value per
+        # super-ob -- same as merge_gc_run.py. Guarded so a non-standard name
+        # never breaks the merge.
+        try:
+            date_val = f.split("____")[1][:8]
+        except (IndexError, AttributeError):
+            date_val = "00000000"
+        dates_list[i] = np.repeat(date_val, obs_GC.shape[0])
 
         # read K from reference dir if precomp_K is true
         if precomp_K:
@@ -110,26 +132,77 @@ def merge_partial_k(satdat_dir, lat_bounds, lon_bounds, obs_errs, precomp_K):
             dat_ref = load_obj(fi_ref)
             K_temp = dat_ref["K"][ind[0]]
         else:
-            K_temp = obj["K"][ind[0]]
+            K_temp = obj["K"][ind[0]] if "K" in obj else None
         
         # add K_temp to K_list
-        K_list[i] = K_temp
+        if K_temp is not None:
+            K_list[i] = np.asarray(K_temp, dtype=np.float32)
 
         for obs_err in obs_errs:
             key = f"so_{obs_err}"
             obs_error = calc_so(obs_err, obs_GC)
-            so_dict[key][i] = obs_error
+            so_dict[key][i] = np.asarray(obs_error, dtype=np.float32)
 
-    K = np.concatenate(K_list, axis=0)
+    K_list = [arr for arr in K_list if arr is not None]
+    geos_prior_list = [arr for arr in geos_prior_list if arr is not None]
+    satellite_list = [arr for arr in satellite_list if arr is not None]
+    lon_list = [arr for arr in lon_list if arr is not None]
+    lat_list = [arr for arr in lat_list if arr is not None]
+    observation_count_list = [arr for arr in observation_count_list if arr is not None]
+    if len(satellite_list) == 0:
+        raise ValueError("No valid observation chunks found for the requested month/domain.")
+
     geos_prior = np.concatenate(geos_prior_list, axis=0)
     satellite = np.concatenate(satellite_list, axis=0)
+    lon = np.concatenate(lon_list, axis=0)
+    lat = np.concatenate(lat_list, axis=0)
+    observation_count = np.concatenate(observation_count_list, axis=0)
+    dates_list = [arr for arr in dates_list if arr is not None]
+    dates = np.concatenate(dates_list, axis=0) if dates_list else np.array([], dtype="<U8")
     for k,v in so_dict.items():
+        v = [arr for arr in v if arr is not None]
         so_dict[k] = np.concatenate(v, axis=0)
 
-    gc_prior = np.asmatrix(geos_prior)
-    obs_satellite = np.asmatrix(satellite)
+    # Store merged monthly products compactly; the solver promotes to float64
+    # internally before matrix algebra.
+    gc_prior = np.asarray(geos_prior, dtype=np.float32)
+    obs_satellite = np.asarray(satellite, dtype=np.float32)
+    lon = np.asarray(lon, dtype=np.float32)
+    lat = np.asarray(lat, dtype=np.float32)
+    observation_count = np.asarray(observation_count, dtype=np.float32)
+    if len(K_list) == 0 and allow_missing_k:
+        K = None
+    elif len(K_list) == 0:
+        existing_k_path = Path("full_jacobian_K.npz")
+        if not existing_k_path.exists():
+            raise ValueError(
+                "No Jacobian chunks were found in the observation-space files, and "
+                f"{existing_k_path} does not exist. Re-run jacobian.py with "
+                "build_jacobian=True, or run this from an inversion directory with "
+                "an existing full_jacobian_K.npz."
+            )
+        with np.load(existing_k_path) as existing_k:
+            K = np.asarray(existing_k["K"], dtype=np.float32)
+        if K.shape[0] != obs_satellite.size:
+            raise ValueError(
+                "Existing full_jacobian_K row count does not match merged "
+                f"observation metadata: {K.shape[0]} vs {obs_satellite.size}."
+            )
+    else:
+        K = np.asarray(np.concatenate(K_list, axis=0), dtype=np.float32)
+    for key, value in so_dict.items():
+        so_dict[key] = np.asarray(value, dtype=np.float32)
 
-    return gc_prior, obs_satellite, K, so_dict
+    obs_metadata = {
+        "lon": lon,
+        "lat": lat,
+        "obs_tropomi": obs_satellite,
+        "gc_ch4_prior": gc_prior,
+        "observation_count": observation_count,
+        "dates": dates,
+    }
+
+    return gc_prior, obs_satellite, K, so_dict, obs_metadata
 
 
 if __name__ == "__main__":
@@ -138,6 +211,8 @@ if __name__ == "__main__":
     state_vector_filepath = sys.argv[2]
     config_path = sys.argv[3]
     precomputed_jacobian = sys.argv[4].lower() == "true"
+    allow_missing_k = len(sys.argv) > 5 and sys.argv[5].lower() == "true"
+    preserve_existing_so = os.environ.get("IMI_PRESERVE_EXISTING_SO", "false").lower() == "true"
 
     # Load config file
     config = load_config(config_path)
@@ -156,11 +231,56 @@ if __name__ == "__main__":
         lat_bounds = [-90, 90]
 
     # Paths to GEOS/satellite data
-    gc_bkgd, obs_satellite, jacobian_K, so_dict = merge_partial_k(
-        satdat_dir, lat_bounds, lon_bounds, obs_errors, precomputed_jacobian
+    gc_bkgd, obs_satellite, jacobian_K, so_dict, obs_metadata = merge_partial_k(
+        satdat_dir, lat_bounds, lon_bounds, obs_errors, precomputed_jacobian, allow_missing_k
     )
 
-    np.savez("full_jacobian_K.npz", K=jacobian_K)
+    if jacobian_K is not None:
+        np.savez("full_jacobian_K.npz", K=jacobian_K)
     np.savez("obs_satellite.npz", obs_satellite=obs_satellite)
     np.savez("gc_bkgd.npz", gc_bkgd=gc_bkgd)
-    np.savez("so_super.npz", **so_dict)
+    np.savez("obs_metadata.npz", **obs_metadata)
+    save_npz_unless_preserving_so("so_super.npz", preserve_existing_so, **so_dict)
+
+    start = str(config["StartDate"])
+    end = str(config["EndDate"])
+    inversion_data_path = os.path.join(config["OutputPath"], config["RunName"], "inversion_data")
+    os.makedirs(os.path.join(inversion_data_path, "K"), exist_ok=True)
+    os.makedirs(os.path.join(inversion_data_path, "obs_ch4_tropomi"), exist_ok=True)
+    os.makedirs(os.path.join(inversion_data_path, "gc_ch4_prior"), exist_ok=True)
+    os.makedirs(os.path.join(inversion_data_path, "observations"), exist_ok=True)
+    os.makedirs(os.path.join(inversion_data_path, "y"), exist_ok=True)
+    os.makedirs(os.path.join(inversion_data_path, "xch4_0"), exist_ok=True)
+    os.makedirs(os.path.join(inversion_data_path, "so"), exist_ok=True)
+    if jacobian_K is not None:
+        np.savez(os.path.join(inversion_data_path, "K", f"K_{start}_{end}.npz"), K=jacobian_K)
+    np.savez(
+        os.path.join(inversion_data_path, "obs_ch4_tropomi", f"obs_ch4_tropomi_{start}_{end}.npz"),
+        obs_tropomi=obs_satellite.reshape(1, -1),
+    )
+    np.savez(
+        os.path.join(inversion_data_path, "gc_ch4_prior", f"gc_ch4_prior_{start}_{end}.npz"),
+        gc_ch4_prior=gc_bkgd,
+        gc_ch4=gc_bkgd,
+    )
+    np.savez(
+        os.path.join(inversion_data_path, "observations", f"observations_{start}_{end}.npz"),
+        **obs_metadata,
+    )
+    # Standalone date file matching the structure of the other per-super-ob arrays
+    os.makedirs(os.path.join(inversion_data_path, "date"), exist_ok=True)
+    np.savez(
+        os.path.join(inversion_data_path, "date", f"date_{start}_{end}.npz"),
+        dates=obs_metadata["dates"],
+    )
+    np.savez(os.path.join(inversion_data_path, "y", f"y_{start}_{end}.npz"), y=obs_satellite)
+    np.savez(
+        os.path.join(inversion_data_path, "xch4_0", f"xch4_0_{start}_{end}.npz"),
+        xch4_0=gc_bkgd,
+        gc_ch4=gc_bkgd,
+    )
+    save_npz_unless_preserving_so(
+        os.path.join(inversion_data_path, "so", f"so_{start}_{end}.npz"),
+        preserve_existing_so,
+        **so_dict,
+    )

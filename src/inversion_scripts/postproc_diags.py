@@ -140,7 +140,11 @@ def fill_missing_hour(run_name, run_dirs_pth, prev_run_pth, start_day, res):
                 },
             )
 
-    results = Parallel(n_jobs=-1)(delayed(process)(run) for run in rundirs)
+    # Cap workers: each loads a run-dir's SpeciesConc+StateMet (memory-heavy; this step OOM'd
+    # historically at all-cores). Bound it to 24 so raising InversionCPUs to 80 for the cheap
+    # obs-cache / K-assembly phases doesn't blow up postproc memory. Override with IMI_POSTPROC_JOBS.
+    _ppj = int(os.environ.get("IMI_POSTPROC_JOBS", "24")); _ppj = max(1, min(_ppj, 24))
+    results = Parallel(n_jobs=_ppj)(delayed(process)(run) for run in rundirs)
 
 
 def fill_missing_hour_posterior(run_dirs_pth, prev_run_pth, start_day, res):

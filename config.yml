@@ -136,6 +136,31 @@ Gamma: [1.0]
 PrecomputedJacobian: false
 OffDiagonalPriorCov: false
 LengthScalePriorCov: 25  ## in km, only used if OffDiagonalPriorCov is true
+## Options for OffDiagonalPriorCov:
+##   PriorCovarianceMethod: "length_scale"        # default
+##   PriorCovarianceMethod: "national_inventory" # country-sector aggregate uncertainties
+## For PriorCovarianceMethod: "national_inventory", also set:
+##   NationalPriorUncertaintyFile: "/path/to/national_prior_uncertainties.csv"
+##   NationalPriorCountryMaskFile: "/path/to/country_mask_on_gc_grid.nc"
+##   NationalPriorCountryMaskVariable: "country_id"
+## Or use a countries shapefile directly:
+##   NationalPriorCountryShapefile: "/path/to/countries.shp"
+##   NationalPriorCountryNameColumn: "NAME"
+
+## Observational error covariance with off-diagonal spatial + temporal correlations.
+## Set OffDiagonalObsCov: true to apply the residual-error method (REM) off-diagonal So:
+## a two-exponential spatial correlation rho(d) = A1*exp(-d/L1) + A2*exp(-d/L2), applied
+## EXACTLY by a day-blocked solve, plus an adjacent-day (lag-1) temporal correlation.
+## Requires DoInversion: true, a completed Jacobian run, and per-observation lat/lon/dates.
+OffDiagonalObsCov: false
+## Off-diagonal So correlation parameters (two-exponential spatial rho(d) + adjacent-day temporal
+## correlation, applied exactly by a day-blocked solve). Fit to South America TROPOMI residuals.
+OffDiagonalObsCovA1: 0.385           # Default 0.385 from Hancock South America work
+OffDiagonalObsCovL1: 26.0            # Default 26.0 km from Hancock South America work
+OffDiagonalObsCovA2: 0.459           # Default 0.459 from Hancock South America work
+OffDiagonalObsCovL2: 398.0           # Default 398.0 km from Hancock South America work
+OffDiagonalObsCovTemporalRho: 0.19   # Default 0.19 from Hancock South America work
+## OffDiagonalObsCovCutoffKm: 1194   # spatial cutoff (km); default = 3 * L2
 
 ## Setup modules
 ##   Turn on/off different steps in setting up the inversion

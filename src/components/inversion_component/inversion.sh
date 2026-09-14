@@ -25,16 +25,19 @@ setup_inversion() {
     fi
 
     cp ${InversionPath}/src/inversion_scripts/invert.py inversion/
+    cp ${InversionPath}/src/inversion_scripts/positivity_solvers.py inversion/
     cp ${InversionPath}/src/inversion_scripts/lognormal_invert.py inversion/
     cp ${InversionPath}/src/inversion_scripts/jacobian.py inversion/
     cp ${InversionPath}/src/inversion_scripts/operators/*.py inversion/operators/
     cp ${InversionPath}/src/inversion_scripts/make_gridded_posterior.py inversion/
     cp ${InversionPath}/src/inversion_scripts/setup_gc_cache.py inversion/
+    cp ${InversionPath}/src/inversion_scripts/setup_jacobian_obs_cache.py inversion/
     cp ${InversionPath}/src/inversion_scripts/utils.py inversion/
     cp ${InversionPath}/src/inversion_scripts/classify_TROPOMI_obs_to_CSgrids.py inversion/
     cp ${InversionPath}/src/inversion_scripts/merge_partial_k.py inversion/
     cp ${InversionPath}/src/inversion_scripts/run_inversion.sh inversion/
     cp ${InversionPath}/src/inversion_scripts/build_full_prior_covariance.py inversion/
+    cp ${InversionPath}/src/inversion_scripts/build_national_inventory_prior_covariance.py inversion/
     cp ${InversionPath}/src/notebooks/visualization_notebook.ipynb inversion/
     cp ${InversionPath}/src/utilities/cleanup_script.sh .
     cp ${InversionPath}/src/utilities/config_utils.py inversion/
@@ -87,7 +90,7 @@ run_inversion() {
             FirstSimSwitch=false
         fi
     else
-        InvDir=${RunDirs}/inversion
+        InvDir=${IMI_INV_DIR:-${RunDirs}/inversion}
         cd $InvDir
     fi
 
@@ -95,7 +98,7 @@ run_inversion() {
     InvMem="${InversionMemory:-$RequestedMemory}"
     InvCPU="${InversionCPUs:-$RequestedCPUs}"
     InvTime="${InversionTime:-$RequestedTime}"
-    InvPartition="${InvSchedulerPartition:-$SchedulerPartition}"
+    InvPartition="${InversionPartition:-test}"
 
     # Execute inversion driver script
     submit_job $SchedulerType false $InvMem $InvCPU $InvTime $InvPartition ${InvDir}/run_inversion.sh $FirstSimSwitch

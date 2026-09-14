@@ -1,0 +1,5 @@
+country_id,country,sector,relative_uncertainty
+170,Colombia,Oil,0.30
+170,Colombia,Gas,0.30
+170,Colombia,Coal,0.50
+170,Colombia,Livestock,0.40

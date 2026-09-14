@@ -13,6 +13,38 @@ from scipy.sparse import csr_matrix
 
 warnings.filterwarnings("ignore", category=UserWarning, module="xarray")
 
+
+def prefer_obs_cache(gc_cache, filename):
+    cached = os.path.join(gc_cache, "obs_cache", filename)
+    if os.path.isfile(cached):
+        return cached
+    return os.path.join(gc_cache, filename)
+
+
+def first_available_species_file(gc_cache, preferred_date=None):
+    candidates = []
+    if preferred_date is not None:
+        filename = f"GEOSChem.SpeciesConc.{preferred_date}00z.nc4"
+        candidates.extend(
+            [
+                prefer_obs_cache(gc_cache, filename),
+                os.path.join(gc_cache, filename),
+            ]
+        )
+    for base in (os.path.join(gc_cache, "obs_cache"), gc_cache):
+        if not os.path.isdir(base):
+            continue
+        matches = sorted(
+            os.path.join(base, f)
+            for f in os.listdir(base)
+            if f.startswith("GEOSChem.SpeciesConc.") and f.endswith(".nc4")
+        )
+        candidates.extend(matches)
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError(f"No GEOS-Chem SpeciesConc files found under {gc_cache}")
+
 # common utilities for using different operators
 def read_all_geoschem(all_strdate, gc_cache, config):
     """
@@ -57,7 +89,7 @@ def read_geoschem(date, gc_cache, config):
     file_pedge = f"GEOSChem.StateMetLevEdge.{date}00z.nc4"
 
     # Read lat, lon, CH4 from the SpeciecConc collection
-    filename = f"{gc_cache}/{file_species}"
+    filename = prefer_obs_cache(gc_cache, file_species)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning, module="xarray")
         gc_data = xr.open_dataset(filename)
@@ -80,7 +112,7 @@ def read_geoschem(date, gc_cache, config):
     gc_data.close()
 
     # Read PEDGE from the StateMetLevEdge collection
-    filename = f"{gc_cache}/{file_pedge}"
+    filename = prefer_obs_cache(gc_cache, file_pedge)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning, module="xarray")
         gc_data = xr.open_dataset(filename)
@@ -158,8 +190,7 @@ def get_gc_lat_lon(gc_cache, start_date):
     """
     gc_ll = {}
     date = pd.to_datetime(start_date).strftime("%Y%m%d_%H")
-    file_species = f"GEOSChem.SpeciesConc.{date}00z.nc4"
-    filename = f"{gc_cache}/{file_species}"
+    filename = first_available_species_file(gc_cache, date)
     gc_data = xr.open_dataset(filename)
     gc_ll["lon"] = gc_data["lon"].values
     gc_ll["lat"] = gc_data["lat"].values

@@ -1,10 +1,14 @@
 import os
+import glob
 import numpy as np
 import xarray as xr
 import pandas as pd
 import datetime
 import gc
-import pygeohash as pgh
+try:
+    import pygeohash as pgh
+except ModuleNotFoundError:
+    pgh = None
 from shapely.geometry import Polygon
 from src.inversion_scripts.utils import (
     read_and_filter_satellite,
@@ -26,6 +30,20 @@ from src.inversion_scripts.operators.operator_utilities import (
 )
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="xarray")
+
+
+def _resolve_species_var(dataset, species, preferred_name):
+    """Return the preferred species variable or a tagged fallback if needed."""
+    if preferred_name in dataset.data_vars:
+        return preferred_name
+    prefix = f"SpeciesConcVV_{species}_"
+    tagged = sorted(v for v in dataset.data_vars if v.startswith(prefix))
+    if tagged:
+        return tagged[0]
+    raise KeyError(
+        f"No variable named '{preferred_name}'. Available {species} variables: "
+        f"{[v for v in dataset.data_vars if species in v][:8]}"
+    )
 
 def apply_average_satellite_operator(
     filename,
@@ -93,6 +111,10 @@ def apply_average_satellite_operator(
     # into each gridcell. Only returns gridcells containing observations
     if config["UseGCHP"]:
         if config['STRETCH_GRID']:
+            if pgh is None:
+                raise ModuleNotFoundError(
+                    "pygeohash is required for stretched-grid GCHP satellite averaging."
+                )
             sf_formatted = f"{config['STRETCH_FACTOR']:.2f}".replace(".", "d")
             target_geohash = pgh.encode(config['TARGET_LAT'], config['TARGET_LON'])
             gridspec_path = f"c{config['CS_RES']}_s{sf_formatted}_t{target_geohash}_gridspec.nc"
@@ -215,7 +237,9 @@ def apply_average_satellite_operator(
 
         if build_jacobian:
             pert_jacobian_xspecies = virtual_satellite_pert # (n_superobs, n_element)
-            emis_base_xspecies = virtual_satellite_base # emis_base and BC_base is "RunName_0001" and "SpeciesConcVV_species"
+            emis_base_xspecies = np.asarray(virtual_satellite_base, dtype=np.float32)
+            if emis_base_xspecies.ndim == 1:
+                emis_base_xspecies = emis_base_xspecies[:, None]
             oh_base_xspecies = virtual_satellite # OH base is "RunName_0000"
 
             # get perturbations and calculate sensitivities
@@ -226,8 +250,7 @@ def apply_average_satellite_operator(
             # fill array with nans
             base_xspecies = np.full((len(gridcell_dict), n_elements), np.nan, dtype=np.float32)
             # fill emission elements with the base value
-            base_xspecies[:,emis_indices] = np.repeat(emis_base_xspecies,
-                                                  np.asarray(emis_indices).size, axis=1)
+            base_xspecies[:,emis_indices] = emis_base_xspecies
 
             # emissions perturbations
             perturbations[:,emis_indices] = np.repeat(emis_perturbations[None,:],
@@ -244,8 +267,7 @@ def apply_average_satellite_operator(
             # BC perturbations
             if config["OptimizeBCs"]:
                 # fill BC elements with the base value, which is same as emis value
-                base_xspecies[:,bc_indices] = np.repeat(emis_base_xspecies,
-                                                    np.asarray(bc_indices).size, axis=1)
+                base_xspecies[:,bc_indices] = emis_base_xspecies
 
                 # compute BC perturbation for jacobian construction
                 perturbations[:,bc_indices] = config["PerturbValueBCs"]
@@ -945,19 +967,76 @@ def get_virtual_satellite(date, gc_cache, gridcell_dict, n_elements, config, bui
 
     UseGCHP = config['UseGCHP']
 
-    # Assemble file paths to GEOS-Chem output collections for input data
+    # Assemble file paths to GEOS-Chem output collections for input data.
     file_species = f"GEOSChem.SpeciesConc.{date}00z.nc4"
     file_pedge = f"GEOSChem.StateMetLevEdge.{date}00z.nc4"
+    species_path = os.path.join(gc_cache, file_species)
+    pedge_path = os.path.join(gc_cache, file_pedge)
+    obs_cache_dir = os.path.join(gc_cache, "obs_cache")
+    species_path_obs = os.path.join(obs_cache_dir, file_species)
+    pedge_path_obs = os.path.join(obs_cache_dir, file_pedge)
+    if os.path.isfile(species_path_obs):
+        species_path = species_path_obs
+    if os.path.isfile(pedge_path_obs):
+        pedge_path = pedge_path_obs
+
+    def subset_obs_cache(gc_data_all):
+        if "obs" not in gc_data_all.dims:
+            return None
+        if config["UseGCHP"]:
+            if not all(v in gc_data_all for v in ("nfi", "Ydimi", "Xdimi")):
+                return None
+            lookup = {
+                (int(nf), int(y), int(x)): idx
+                for idx, (nf, y, x) in enumerate(
+                    zip(
+                        gc_data_all["nfi"].values,
+                        gc_data_all["Ydimi"].values,
+                        gc_data_all["Xdimi"].values,
+                    )
+                )
+            }
+            obs_idx = np.array(
+                [
+                    lookup[(int(nf), int(y), int(x))]
+                    for nf, y, x in zip(
+                        gridcell_dict["nfi"], gridcell_dict["Ydimi"], gridcell_dict["Xdimi"]
+                    )
+                ],
+                dtype=np.int32,
+            )
+        else:
+            if not all(v in gc_data_all for v in ("iGC", "jGC")):
+                return None
+            lookup = {
+                (int(i), int(j)): idx
+                for idx, (i, j) in enumerate(
+                    zip(gc_data_all["iGC"].values, gc_data_all["jGC"].values)
+                )
+            }
+            obs_idx = np.array(
+                [
+                    lookup[(int(i), int(j))]
+                    for i, j in zip(gridcell_dict["iGC"], gridcell_dict["jGC"])
+                ],
+                dtype=np.int32,
+            )
+        return gc_data_all.isel(
+            time=0,
+            obs=xr.DataArray(obs_idx, dims="obs"),
+            drop=True,
+        )
 
     # Read lat, lon, species from the SpeciecConc collection
-    filename = f"{gc_cache}/{file_species}"
-
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning, module="xarray")
-        with xr.open_dataset(filename, chunks='auto') as gc_data_all:
+        with xr.open_dataset(species_path) as gc_data_all:
             if gc_data_all.sizes.get("time", 0) == 0:
-                print(f"ERROR: {filename}: empty time dimension", flush=True)
-            if UseGCHP:
+                print(f"ERROR: {species_path}: empty time dimension", flush=True)
+            sampled = subset_obs_cache(gc_data_all)
+            if sampled is not None:
+                gc_data = sampled
+            elif UseGCHP:
                 nfi   = xr.DataArray(gridcell_dict["nfi"],   dims="obs")
                 Ydimi = xr.DataArray(gridcell_dict["Ydimi"], dims="obs")
                 Xdimi = xr.DataArray(gridcell_dict["Xdimi"], dims="obs")
@@ -972,32 +1051,38 @@ def get_virtual_satellite(date, gc_cache, gridcell_dict, n_elements, config, bui
             else:
                 jGC   = xr.DataArray(gridcell_dict["jGC"],   dims="obs")
                 iGC   = xr.DataArray(gridcell_dict["iGC"],   dims="obs")
+                time_index = 0
                 gc_data = gc_data_all.isel(
-                    time=0).squeeze().isel(
+                    time=time_index).squeeze().isel(
                     lat=jGC,
                     lon=iGC,
                     drop=True
                 )
-            species = gc_data[f"SpeciesConcVV_{config['Species']}"].transpose("obs","lev").values
+            species_var = _resolve_species_var(
+                gc_data, config["Species"], f"SpeciesConcVV_{config['Species']}"
+            )
+            species = gc_data[species_var].transpose("obs","lev").values
 
     # Read PEDGE from the StateMetLevEdge collection
-    filename = f"{gc_cache}/{file_pedge}"
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning, module="xarray")
-        with xr.open_dataset(filename, chunks='auto') as gc_data_all:
+        with xr.open_dataset(pedge_path) as gc_data_all:
             if gc_data_all.sizes.get("time", 0) == 0:
-                print(f"ERROR: {filename}: empty time dimension", flush=True)
-            if UseGCHP:
+                print(f"ERROR: {pedge_path}: empty time dimension", flush=True)
+            sampled = subset_obs_cache(gc_data_all)
+            if sampled is not None:
+                gc_data = sampled
+            elif UseGCHP:
                 gc_data = gc_data_all.isel(
                     time=0).squeeze().isel(
-                    nf=nfi,
+                        nf=nfi,
                     Ydim=Ydimi,
                     Xdim=Xdimi,
                     drop=True
                 )
             else:
                 gc_data = gc_data_all.isel(
-                    time=0).squeeze().isel(
+                    time=time_index).squeeze().isel(
                     lat=jGC,
                     lon=iGC,
                     drop=True
@@ -1139,11 +1224,14 @@ def get_virtual_satellite_pert(gc_date, run_id, gridcell_dict, config, sv_elems,
         tracer elements in this run, in unitless mixing ratio.
     """
     prefix = os.path.expandvars(
-        config["OutputPath"] + "/" + config["RunName"] + "/jacobian_runs"
+        os.environ.get("IMI_JACOBIAN_RUNS_DIR", config["OutputPath"] + "/" + config["RunName"] + "/jacobian_runs")
     )
     j_dir = f"{prefix}/{config['RunName']}_{run_id}/OutputDir"
+    sampled_dir = os.path.join(j_dir, "obs_cache")
+    file_stub_hourly = gc_date.strftime("GEOSChem.SpeciesConc.%Y%m%d_%H00z.nc4")
+    sampled_path = os.path.join(sampled_dir, file_stub_hourly)
     file_stub = gc_date.strftime("GEOSChem.SpeciesConc.%Y%m%d_0000z.nc4")
-    filepath = os.path.join(j_dir, file_stub)
+    filepath = sampled_path if os.path.isfile(sampled_path) else os.path.join(j_dir, file_stub)
 
     # Construct the list of species vars to request
     keepvars = [f"SpeciesConcVV_{config['Species']}_{i:04}" for i in sv_elems]
@@ -1166,25 +1254,64 @@ def get_virtual_satellite_pert(gc_date, run_id, gridcell_dict, config, sv_elems,
     if baserun:
         keepvars = [f"SpeciesConcVV_{config['Species']}"]
 
-    # It would fail if open all variables with chunks with GCHP,
-    # as ncontact is duplicate for GCHP output dimensions
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=UserWarning, module="xarray")
-        with xr.open_dataset(filepath, decode_cf=False) as tmp:
-            other_vars = [v for v in tmp.variables if f"SpeciesConcVV_{config['Species']}" not in v]
+    def subset_obs_cache(dsmf_all):
+        if "obs" not in dsmf_all.dims:
+            return None
+        if config["UseGCHP"]:
+            if not all(v in dsmf_all for v in ("nfi", "Ydimi", "Xdimi")):
+                return None
+            lookup = {
+                (int(nf), int(y), int(x)): idx
+                for idx, (nf, y, x) in enumerate(
+                    zip(
+                        dsmf_all["nfi"].values,
+                        dsmf_all["Ydimi"].values,
+                        dsmf_all["Xdimi"].values,
+                    )
+                )
+            }
+            obs_idx = np.array(
+                [
+                    lookup[(int(nf), int(y), int(x))]
+                    for nf, y, x in zip(
+                        gridcell_dict["nfi"], gridcell_dict["Ydimi"], gridcell_dict["Xdimi"]
+                    )
+                ],
+                dtype=np.int32,
+            )
+        else:
+            if not all(v in dsmf_all for v in ("iGC", "jGC")):
+                return None
+            lookup = {
+                (int(i), int(j)): idx
+                for idx, (i, j) in enumerate(
+                    zip(dsmf_all["iGC"].values, dsmf_all["jGC"].values)
+                )
+            }
+            obs_idx = np.array(
+                [
+                    lookup[(int(i), int(j))]
+                    for i, j in zip(gridcell_dict["iGC"], gridcell_dict["jGC"])
+                ],
+                dtype=np.int32,
+            )
+        return dsmf_all.isel(
+            time=0,
+            obs=xr.DataArray(obs_idx, dims="obs"),
+            drop=True,
+        )
 
     # Open only these variables
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning, module="xarray")
-        with xr.open_dataset(
-            filepath,
-            drop_variables=other_vars,
-            chunks="auto"
-        ) as dsmf_all:
+        with xr.open_dataset(filepath, decode_cf=False) as dsmf_all:
             try:
                 if dsmf_all.sizes.get("time", 0) == 0:
                     print(f"ERROR: {filepath}: empty time dimension", flush=True)
-                if config['UseGCHP']:
+                sampled = subset_obs_cache(dsmf_all)
+                if sampled is not None:
+                    dsmf = sampled
+                elif config['UseGCHP']:
                     nfi   = xr.DataArray(gridcell_dict["nfi"],   dims="obs")
                     Ydimi = xr.DataArray(gridcell_dict["Ydimi"], dims="obs")
                     Xdimi = xr.DataArray(gridcell_dict["Xdimi"], dims="obs")
@@ -1198,8 +1325,9 @@ def get_virtual_satellite_pert(gc_date, run_id, gridcell_dict, config, sv_elems,
                 else:
                     jGC   = xr.DataArray(gridcell_dict["jGC"],   dims="obs")
                     iGC   = xr.DataArray(gridcell_dict["iGC"],   dims="obs")
+                    time_index = gc_date.hour
                     dsmf = dsmf_all.isel(
-                        time=gc_date.hour).squeeze().isel(
+                        time=time_index).squeeze().isel(
                         lat=jGC,
                         lon=iGC,
                         drop=True
@@ -1210,7 +1338,10 @@ def get_virtual_satellite_pert(gc_date, run_id, gridcell_dict, config, sv_elems,
 
             # ---- Batch read all species and standardize to (elem, obs, lev)
             da_list = []
-            for v in keepvars:
+            resolved_keepvars = [
+                _resolve_species_var(dsmf, config["Species"], v) for v in keepvars
+            ]
+            for v in resolved_keepvars:
                 da = dsmf[v]
                 # Ensure shape is (obs, lev)
                 arr = da.transpose("obs","lev").values
