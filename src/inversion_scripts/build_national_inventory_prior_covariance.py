@@ -51,6 +51,18 @@ SAUNOIS_GLOBAL_DEFAULTS = {
     "Termites": 0.60,
 }
 
+# GENUINE Saunois et al. global (bottom-up) 1-sigma relative uncertainties per source. These are the
+# TRUE global sectoral uncertainties (much lower than the inflated cross-country-BTR-median fallback
+# above): being <= the mean national uncertainty, they are always reachable by the cross-country
+# correlation without capping. Used as the default GLOBAL BACKGROUND (NationalPriorGlobalBackground);
+# override per sector with NationalPriorGlobalBackgroundValues. Keys = HEMCO EmisCH4_* suffixes.
+SAUNOIS_GLOBAL_BACKGROUND = {
+    "Livestock": 0.05, "Rice": 0.22, "Landfills": 0.19, "Wastewater": 0.19,
+    "Coal": 0.10, "Gas": 0.15, "Oil": 0.15, "OilGas": 0.15, "OtherAnth": 0.80,
+    "Wetlands": 0.28, "Reservoirs": 0.80, "Lakes": 0.80, "InlandWaters": 0.80,
+    "Seeps": 0.60, "Termites": 0.60, "BiomassBurn": 0.41,
+}
+
 
 def build_saunois_default_table():
     """Synthetic uncertainty table using Saunois et al. global sectoral defaults.
@@ -362,23 +374,32 @@ def build_weighted_correlation(rows, totals_by_element, group_rho):
 
 def two_component_absolute(
     rows, neff_sum, neff_sumsq, uncertainty_rows, n_elements,
-    grid_national_ratio=2.5, min_uncertainty=0.30,
+    grid_national_ratio=2.5, min_uncertainty=0.30, global_background=None,
 ):
-    """Two-component anthropogenic prior error covariance in ABSOLUTE emission^2 units.
+    """Prior error covariance in ABSOLUTE emission^2 units, as a sum of three nested, independent
+    error components (a variance-components / random-effects model). For two cells i, j of one sector:
 
-    Per (country, sector) group the within-country prior covariance is
-        national rank-1 :  snat^2 * E_i * E_j
-        local diagonal  :  snat^2 * (ratio_i^2 - 1) * E_i^2
-    with ratio_i = sqrt(1 + (R01^2 - 1) / n_eff_i) the grid:national error ratio
-    (n_eff_i = effective number of independent native cells in the element), and
-        snat = u_BTR / sqrt(1 + Q),   Q = sum_i (ratio_i^2 - 1) E_i^2 / E_c^2,
-    chosen so the national aggregate uncertainty equals u_BTR EXACTLY.  Sector
-    contributions are summed (sectors are independent).  Only groups that appear in
-    uncertainty_rows contribute; every other element stays zero here (its variance is
-    supplied by another block, e.g. the wetland ensemble, or the uniform fallback in
-    decompose_relative_covariance).  Returns (Sa_abs, diagnostics).
-    """
+        GLOBAL    g_s^2   * E_i E_j     for EVERY pair (all countries)          <- Saunois systematic
+        NATIONAL  snat^2  * E_i E_j     only for pairs in the SAME country       <- BTR national error
+        LOCAL     snat^2 (ratio_i^2-1) * E_i^2   on the diagonal only            <- grid-scale wiggle
+
+    so   within a country :  Sa_ij = (g_s^2 + snat^2) E_i E_j   (+ LOCAL on the diagonal)
+         across countries :  Sa_ij =  g_s^2          E_i E_j.
+
+    ratio_i = sqrt(1 + (R01^2 - 1)/n_eff_i) is the grid:national error ratio (n_eff_i = effective number
+    of independent native cells in element i). The GLOBAL systematic g_s = global_background[sector] (a
+    genuine Saunois global uncertainty) is common to every cell of the sector everywhere, so the
+    continental/global aggregate never averages below g_s. To keep the NATIONAL aggregate EXACTLY u_BTR,
+    g_s is PEELED from u_BTR in quadrature: the national+local part uses the residual
+        u_res = sqrt(u_BTR^2 - g_s^2),   snat = u_res / sqrt(1 + Q),   Q = sum_i (ratio_i^2-1) E_i^2 / E_c^2,
+    so within a country GLOBAL + NATIONAL + LOCAL sum back to u_BTR exactly. This needs g_s <= u_BTR,
+    which genuine Saunois values always satisfy against the 30% BTR floor; if a sector ever has g_s >
+    u_BTR the residual clips to 0 (that country's error becomes fully global and its aggregate rises to
+    g_s > u_BTR, flagged in the diagnostics). global_background=None (or g_s=0) recovers the plain
+    two-component. Sectors are independent (summed). Returns (Sa_abs, diagnostics)."""
+    bg = global_background or {}
     Sa_abs = np.zeros((n_elements, n_elements), dtype=np.float64)
+    sector_emis = defaultdict(lambda: np.zeros(n_elements, dtype=np.float64))   # per-sector emission, for the GLOBAL rank-1
 
     emissions_by_group = defaultdict(lambda: defaultdict(float))
     for (country_id, sector, pos), value in rows.items():
@@ -399,6 +420,8 @@ def two_component_absolute(
         total = float(emis.sum())
         if total <= 0:
             continue
+        g = float(bg.get(sector, 0.0))                         # GLOBAL (Saunois) systematic for this sector
+        u_res = np.sqrt(max(u * u - g * g, 0.0))               # peel g from u_BTR in quadrature (0 if g > u)
         n_eff = np.array([
             (neff_sum[(sector, int(p))] ** 2 / neff_sumsq[(sector, int(p))])
             if neff_sumsq.get((sector, int(p)), 0.0) > 0 else 1.0
@@ -407,15 +430,28 @@ def two_component_absolute(
         n_eff = np.clip(n_eff, 1.0, None)
         r2 = (grid_national_ratio ** 2 - 1.0) / n_eff          # ratio_i^2 - 1 (local excess)
         Q = float(np.sum(r2 * emis ** 2)) / (total * total)
-        snat = u / np.sqrt(1.0 + Q)
-        Sa_abs[np.ix_(positions, positions)] += (snat * snat) * np.outer(emis, emis)  # national rank-1
-        Sa_abs[positions, positions] += (snat * snat) * r2 * emis ** 2                # local diagonal
-        achieved = snat * np.sqrt(total * total + float(np.sum(r2 * emis ** 2))) / total
+        snat = u_res / np.sqrt(1.0 + Q)                        # NATIONAL amplitude from the RESIDUAL uncertainty
+        Sa_abs[np.ix_(positions, positions)] += (snat * snat) * np.outer(emis, emis)  # NATIONAL rank-1 (within country)
+        Sa_abs[positions, positions] += (snat * snat) * r2 * emis ** 2                # LOCAL diagonal
+        sector_emis[sector][positions] += emis                # accumulate for the GLOBAL rank-1 (added below)
+        # national aggregate = GLOBAL g^2 E_c^2 + NATIONAL snat^2 E_c^2 + LOCAL = (g^2 + u_res^2) E_c^2 = u_BTR^2 E_c^2
+        achieved = np.sqrt((snat * snat) * (total * total + float(np.sum(r2 * emis ** 2)))
+                           + (g * g) * total * total) / total
         diagnostics.append({
             "country_id": country_id, "sector": sector, "status": "ok",
-            "relative_uncertainty": u, "achieved_relative_uncertainty": achieved,
+            "relative_uncertainty": u, "global_background": g,
+            "national_residual_uncertainty": float(u_res),
+            "achieved_relative_uncertainty": float(achieved),   # == u_BTR (or g_s if g_s > u_BTR)
             "n_elements": int(positions.size), "median_ratio": float(np.median(np.sqrt(1.0 + r2))),
         })
+
+    # ---- GLOBAL rank-1 per sector: g_s^2 * outer(e_s, e_s) over ALL cells => couples every country ----
+    for sector, e_s in sector_emis.items():
+        g = float(bg.get(sector, 0.0))
+        if g <= 0 or float(e_s.sum()) <= 0:
+            continue
+        pos = np.nonzero(e_s)[0]
+        Sa_abs[np.ix_(pos, pos)] += (g * g) * np.outer(e_s[pos], e_s[pos])
     return Sa_abs, diagnostics
 
 
@@ -438,15 +474,18 @@ def decompose_relative_covariance(Sa_abs, totals_by_element, prior_sigma):
 
 def build_two_component_covariance(
     rows, neff_sum, neff_sumsq, uncertainty_rows, totals_by_element,
-    prior_sigma, grid_national_ratio=2.5, min_uncertainty=0.30,
+    prior_sigma, grid_national_ratio=2.5, min_uncertainty=0.30, global_background=None,
 ):
-    """Exact two-component prior error covariance (returns correlation C, per-element sigma,
-    diagnostics).  Thin wrapper: assemble the absolute covariance (two_component_absolute)
-    then decompose it exactly into (C, sigma) (decompose_relative_covariance).  Fits the
-    standard (correlation, sigma_scale) output contract with no approximation."""
+    """Exact three-component prior error covariance (returns correlation C, per-element sigma,
+    diagnostics).  Thin wrapper: assemble the absolute covariance (two_component_absolute, which adds
+    the GLOBAL Saunois systematic as a domain-wide rank-1 per sector, peeled from u_BTR so national
+    aggregates stay exactly at u_BTR), then decompose it exactly into (C, sigma)
+    (decompose_relative_covariance).  Fits the standard (correlation, sigma_scale) output contract with
+    no approximation. global_background=None recovers the plain two-component."""
     n = len(totals_by_element)
     Sa_abs, diagnostics = two_component_absolute(
-        rows, neff_sum, neff_sumsq, uncertainty_rows, n, grid_national_ratio, min_uncertainty
+        rows, neff_sum, neff_sumsq, uncertainty_rows, n,
+        grid_national_ratio, min_uncertainty, global_background,
     )
     C, sigma_out = decompose_relative_covariance(Sa_abs, totals_by_element, prior_sigma)
     return C, sigma_out, diagnostics
@@ -538,9 +577,21 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
         # unit-diagonal correlation + per-element sigma.
         grid_national_ratio = float(config.get("NationalPriorGridNationalRatio", 2.5))
         min_uncertainty = float(config.get("NationalPriorMinUncertainty", 0.30))
+        global_background = None
+        if str(config.get("NationalPriorGlobalBackground", True)).strip().lower() in ("true", "1", "yes"):   # default ON
+            # Saunois GLOBAL BACKGROUND: a domain-wide rank-1 per sector (magnitude g_s), PEELED from
+            # u_BTR in quadrature so every national aggregate stays EXACTLY at u_BTR while the
+            # continental/global aggregate keeps a Saunois floor (within a country: global + national +
+            # local; across countries: global only). Defaults to SAUNOIS_GLOBAL_BACKGROUND; override per
+            # sector with NationalPriorGlobalBackgroundValues: {sector: relative_uncertainty}.
+            global_background = dict(SAUNOIS_GLOBAL_BACKGROUND)   # genuine Saunois global values
+            global_background.update(config.get("NationalPriorGlobalBackgroundValues", {}) or {})
+            print(f"Global background (Saunois) ON: {len(global_background)} sectors "
+                  f"(e.g. Wetlands={global_background.get('Wetlands')}, Coal={global_background.get('Coal')}); "
+                  f"peeled from u_BTR so national aggregates stay at u_BTR, continental floored to Saunois.")
         covariance, sigma_vector, diagnostics = build_two_component_covariance(
             rows, neff_sum, neff_sumsq, uncertainty_rows, totals_by_element,
-            prior_sigma, grid_national_ratio, min_uncertainty,
+            prior_sigma, grid_national_ratio, min_uncertainty, global_background,
         )
         if not diagnostics:
             raise ValueError(

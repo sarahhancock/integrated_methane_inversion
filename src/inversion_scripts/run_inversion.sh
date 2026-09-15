@@ -265,7 +265,7 @@ fi
 # Optionally build residual-error observational error covariance (So)
 # with off-diagonal spatial correlations derived from residual anomalies
 #=======================================================================
-OffDiagonalObsCov="${OffDiagonalObsCov:-false}"
+OffDiagonalObsCov="${OffDiagonalObsCov:-true}"   # default ON: data-driven per-cell REM So (not the fixed uniform ObsError)
 if "$OffDiagonalObsCov"; then
     printf "Calling build_residual_obs_covariance.py\n"
     python ${InvDir}/build_residual_obs_covariance.py \

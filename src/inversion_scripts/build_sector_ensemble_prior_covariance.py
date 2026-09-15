@@ -40,6 +40,7 @@ from utils import ensure_float_list, get_mean_emissions
 # reuse the national-inventory builder's helpers (both scripts live in the inversion run dir)
 try:
     from src.inversion_scripts.build_national_inventory_prior_covariance import (
+        SAUNOIS_GLOBAL_BACKGROUND,
         append_buffer_elements,
         build_all_ones_country_mask,
         build_country_mask_from_shapes,
@@ -58,6 +59,7 @@ try:
     )
 except ModuleNotFoundError:
     from build_national_inventory_prior_covariance import (
+        SAUNOIS_GLOBAL_BACKGROUND,
         append_buffer_elements,
         build_all_ones_country_mask,
         build_country_mask_from_shapes,
@@ -228,8 +230,14 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
     grid_national_ratio = float(config.get("NationalPriorGridNationalRatio", 2.5))
     min_uncertainty = float(config.get("NationalPriorMinUncertainty", 0.30))
     anthro_rows = [r for r in uncertainty_rows if r["sector"] in two_component_sectors]
+    global_background = None
+    if str(config.get("NationalPriorGlobalBackground", True)).strip().lower() in ("true", "1", "yes"):   # default ON
+        global_background = dict(SAUNOIS_GLOBAL_BACKGROUND)                       # genuine Saunois global values
+        global_background.update(config.get("NationalPriorGlobalBackgroundValues", {}) or {})
+        print("Global background (Saunois) ON for anthro: GLOBAL systematic peeled from u_BTR (national "
+              "aggregates unchanged) and added domain-wide, so continental/global aggregates keep a Saunois floor.")
     Sa_abs, tc_diag = two_component_absolute(
-        rows, neff_sum, neff_sumsq, anthro_rows, n, grid_national_ratio, min_uncertainty
+        rows, neff_sum, neff_sumsq, anthro_rows, n, grid_national_ratio, min_uncertainty, global_background
     )
     diagnostics.extend(tc_diag)
     if not tc_diag:
@@ -243,12 +251,31 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
         sigma_w, length_w = load_wetland_ensemble_sigma(wetland_file, config, elat, elon)
         e_w = sector_emis["Wetlands"]
         we = sigma_w * e_w
-        Sa_abs += np.outer(we, we) * np.exp(-dist / length_w)
+        Cw = np.exp(-dist / length_w)                      # ensemble correlation (161 km)
+        rho_w = 0.0
+        if str(config.get("SectorEnsembleWetlandGlobalBackground", True)).strip().lower() in ("true", "1", "yes"):   # default ON
+            # Saunois global background for wetlands (the natural-emission analogue of the anthro
+            # cross-country term): a domain-wide correlation FLOOR added to the ensemble correlation,
+            #     C = (1 - rho) * exp(-d/L) + rho.
+            # The diagonal stays 1 so the per-cell ensemble sigma is UNCHANGED; rho is solved so the
+            # continental wetland aggregate equals the Saunois wetland target g_wet (never averages
+            # below it). Wetlands carry no BTR national aggregate to preserve, so a uniform floor is
+            # appropriate (it does raise the wetland national aggregate, which is intended).
+            g_wet = float(config.get("SectorEnsembleWetlandGlobalValue", 0.28))
+            E_wet = float(e_w.sum()); var0 = float(we @ Cw @ we); full = float(we.sum()) ** 2
+            denom = full - var0
+            rho_w = float(np.clip(((g_wet * E_wet) ** 2 - var0) / denom, 0.0, 1.0)) if denom > 1e-9 else 0.0
+            Cw = (1.0 - rho_w) * Cw + rho_w
+            achieved = np.sqrt(max((1 - rho_w) * var0 + rho_w * full, 0.0)) / E_wet if E_wet > 0 else 0.0
+            print(f"Wetland global background ON: g_wet={g_wet:.2f}, rho={rho_w:.3f}, "
+                  f"continental wetland aggregate {np.sqrt(max(var0,0))/E_wet if E_wet>0 else 0:.3f} -> {achieved:.3f} "
+                  f"(per-cell sigma unchanged).")
+        Sa_abs += np.outer(we, we) * Cw
         wetland_handled = True
         pos = e_w > 0
         diagnostics.append({
             "sector": "Wetlands", "status": "ok", "method": "ensemble",
-            "length_km": length_w,
+            "length_km": length_w, "rho_global": rho_w,
             "sigma_median": float(np.median(sigma_w[pos])) if pos.any() else 0.0,
             "n_elements": int(pos.sum()),
         })

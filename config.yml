@@ -161,13 +161,32 @@ LengthScalePriorCov: 25  ## in km, only used if OffDiagonalPriorCov is true
 ##         SectorEnsembleGenericLengthKm: 200            # km (Yu et al. 2021)
 ##   # SectorEnsembleSigmaFloor: 0.15 ; SectorEnsembleSigmaCap: 2.0   # per-cell wetland sigma clip
 ##   # SectorEnsembleTwoComponentSectors / SectorEnsembleGenericSectors override the sector partition.
+##
+## GLOBAL BACKGROUND (makes the prior a THREE-component covariance; recommended for continental/global
+## domains). Adds a domain-wide "global systematic" error per sector (magnitude = genuine Saunois et al.
+## global sectoral uncertainty), so that aggregating emissions over a large area never drives the error
+## unrealistically small. For two cells of one sector:
+##     within the same country :  error = global + national + local
+##     in different countries   :  error = global only
+## The global part is PEELED from the reported (BTR) uncertainty in quadrature, so every NATIONAL
+## aggregate still equals u_BTR EXACTLY -- only the continental/global aggregate is floored to Saunois.
+## In practice this barely moves the anthropogenic sectors (genuine Saunois anthro values are small) and
+## mainly lifts the wetland (short-correlation) sector at continental scale. Genuine Saunois defaults are
+## built in, so no extra files are needed. Both are ON BY DEFAULT (the recommended method); set them to
+## false only to reproduce the old two-component prior:
+##   NationalPriorGlobalBackground: true            # anthro sectors (national_inventory & sector_ensemble); default true
+##   SectorEnsembleWetlandGlobalBackground: true    # wetlands (correlation floor on the ensemble kernel); default true
+##   # NationalPriorGlobalBackgroundValues: {Coal: 0.10, Oil: 0.15, ...}   # override the Saunois defaults
+##   # SectorEnsembleWetlandGlobalValue: 0.28                              # Saunois global wetland 1-sigma
 
-## Observational error covariance with off-diagonal spatial + temporal correlations.
-## Set OffDiagonalObsCov: true to apply the residual-error method (REM) off-diagonal So:
-## a two-exponential spatial correlation rho(d) = A1*exp(-d/L1) + A2*exp(-d/L2), applied
-## EXACTLY by a day-blocked solve, plus an adjacent-day (lag-1) temporal correlation.
+## Observational error covariance from the residual-error method (REM). ON BY DEFAULT: it replaces the
+## uniform config ObsError with a PER-CELL diagonal So -- each cell's error magnitude (sk) is estimated
+## from its own residual variance, then scaled by the Chen et al. (2023) super-observation count curve --
+## and adds off-diagonal correlations: a two-exponential spatial rho(d) = A1*exp(-d/L1) + A2*exp(-d/L2)
+## applied EXACTLY by a day-blocked solve, plus an adjacent-day (lag-1) temporal correlation. Set to
+## false to fall back to the fixed, spatially-uniform ObsError (the upstream IMI default).
 ## Requires DoInversion: true, a completed Jacobian run, and per-observation lat/lon/dates.
-OffDiagonalObsCov: false
+OffDiagonalObsCov: true
 ## Off-diagonal So correlation parameters (two-exponential spatial rho(d) + adjacent-day temporal
 ## correlation, applied exactly by a day-blocked solve). Fit to South America TROPOMI residuals.
 OffDiagonalObsCovA1: 0.385           # Default 0.385 from Hancock South America work
