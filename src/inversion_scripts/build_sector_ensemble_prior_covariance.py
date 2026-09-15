@@ -14,8 +14,10 @@ standard (unit-diagonal correlation, per-element sigma) contract:
      sigma_i (inter-model spread) mapped onto the state-vector elements and a correlation
      length L fit from the ensemble variogram.  Enabled by SectorEnsembleWetlandFile.
   3. Remaining natural sectors + OtherAnth -> a generic correlated block
-     diag(sigma E) [exp(-d/L) o S] diag(sigma E) with sigma=0.5, L=200 km (Yu et al. 2021)
-     and S the cosine similarity of the cells' sectoral composition.
+     diag(sigma E) [exp(-d/L) o S] diag(sigma E) with sigma=0.5 and S the cosine similarity of the
+     cells' sectoral composition, at L = the wetland ensemble length (fallback 200 km, Yu et al. 2021).
+     Each sector also gets a domain-wide Saunois systematic g_s^2 outer(e_s, e_s) so its continental
+     aggregate is floored to the Saunois value (the minor-natural analogue of the wetland floor).
 
 Every block is built in absolute units, summed, divided by outer(E_total, E_total), and
 split exactly into (C, sigma) -- identical output contract to the other prior-covariance
@@ -247,6 +249,7 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
     # ---- (2) wetland ensemble covariance (absolute units) ----
     wetland_file = config.get("SectorEnsembleWetlandFile")
     wetland_handled = False
+    length_w = None                                        # wetland ensemble length, reused by the generic block below
     if wetland_file and "Wetlands" in sector_emis:
         sigma_w, length_w = load_wetland_ensemble_sigma(wetland_file, config, elat, elon)
         e_w = sector_emis["Wetlands"]
@@ -293,7 +296,10 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
     generic_sectors = [s for s in generic_sectors if s in sector_emis]
     if generic_sectors:
         generic_sigma = float(config.get("SectorEnsembleGenericSigma", 0.5))
-        generic_length = float(config.get("SectorEnsembleGenericLengthKm", 200.0))
+        # Length: reuse the wetland ensemble's fitted length by default -- one consistent, data-derived
+        # length for all the naturals; fall back to 200 km (Yu et al. 2021) only when there is no wetland file.
+        generic_length = float(config.get("SectorEnsembleGenericLengthKm",
+                                          length_w if (wetland_handled and length_w) else 200.0))
         comp = np.stack([sector_emis[s] for s in generic_sectors], axis=1)   # (n, n_generic)
         e_non = comp.sum(axis=1)
         norm = np.linalg.norm(comp, axis=1)
@@ -302,14 +308,36 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
         unit[nz] = comp[nz] / norm[nz, None]
         similarity = unit @ unit.T                                          # cosine similarity (PSD)
         sb = generic_sigma * e_non
-        Sa_abs += np.outer(sb, sb) * np.exp(-dist / generic_length) * similarity
-        diagnostics.append({
-            "sector": "+".join(generic_sectors), "status": "ok", "method": "generic",
-            "length_km": generic_length, "sigma": generic_sigma,
-            "n_elements": int((e_non > 0).sum()),
-        })
+        K_gen = np.exp(-dist / generic_length) * similarity                 # the generic block's kernel (K o S)
+        Sa_abs += np.outer(sb, sb) * K_gen
+        # Saunois GLOBAL BACKGROUND for the minor naturals -- the analogue of the wetland floor and the
+        # anthro global term. Each sector gets a domain-wide, fully-correlated systematic c_s * outer(e_s, e_s)
+        # so its CONTINENTAL aggregate equals the Saunois value g_s EXACTLY. The sector's own local continental
+        # variance is PEELED out first (c_s = g_s^2 - local_var_s / E_s^2), so local + floor = g_s^2 (same trick
+        # as u_res = sqrt(u_BTR^2 - g^2) for anthro). c_s clips at 0 if the local aggregate already exceeds g_s.
+        # Defaults to SAUNOIS_GLOBAL_BACKGROUND; ON by default.
+        gbg = None
+        if str(config.get("SectorEnsembleGenericGlobalBackground", True)).strip().lower() in ("true", "1", "yes"):
+            gbg = dict(SAUNOIS_GLOBAL_BACKGROUND)
+            gbg.update(config.get("SectorEnsembleGenericGlobalBackgroundValues", {}) or {})
+            for s in generic_sectors:
+                g = float(gbg.get(s, 0.0)); es = sector_emis[s]; Es = float(es.sum())
+                if g <= 0.0 or Es <= 0.0:
+                    continue
+                local_var = generic_sigma * generic_sigma * float(es @ K_gen @ e_non)   # sector s's continental var from the local block
+                c = max(g * g - local_var / (Es * Es), 0.0)                              # PEEL: local + floor = g_s exactly
+                Sa_abs += c * np.outer(es, es)
+        for s in generic_sectors:                                           # per-sector diagnostics
+            es = sector_emis[s]
+            diagnostics.append({
+                "sector": s, "status": "ok", "method": "generic",
+                "length_km": generic_length, "sigma": generic_sigma,
+                "global_background": float(gbg.get(s, 0.0)) if gbg is not None else 0.0,
+                "n_elements": int((es > 0).sum()),
+            })
         print(f"Generic correlated block: sectors={generic_sectors}, sigma={generic_sigma}, "
-              f"L={generic_length:.0f} km.")
+              f"L={generic_length:.0f} km, Saunois floor={'on' if gbg is not None else 'off'}"
+              + (f" (e.g. Reservoirs={gbg.get('Reservoirs')}, BiomassBurn={gbg.get('BiomassBurn')})" if gbg else "") + ".")
 
     # ---- decompose to (correlation, sigma), PSD-repair, append buffer, write ----
     covariance, sigma_vector = decompose_relative_covariance(Sa_abs, totals_by_element, prior_sigma)
