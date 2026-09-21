@@ -118,7 +118,8 @@ def run_softplus(
     kappa=10.0,
     posterior_mean=True,
     mean_relaxation=0.5,
-    max_iter=120,
+    mean_every=20,
+    max_iter=500,
     tol=5e-3,
 ):
     """Softplus-positivity inversion in normal-equation (KTinvSoK, KTinvSoy) space.
@@ -175,10 +176,18 @@ def run_softplus(
         sf_new, _ = field(z_new, variance)
         step = np.max(np.abs(sf_new[:n_roi] - sf[:n_roi]) / np.maximum(sf[:n_roi], 1e-9))
         z = z_new
-        if posterior_mean:
+        # Update the posterior-mean variance only periodically (mirrors the lognormal solver's
+        # mean-correction c, refreshed every MF_EVERY iterations): holding the variance fixed
+        # between updates lets the mode iteration settle.  Updating it every iteration -- the
+        # previous behaviour -- chased a moving mean and did not converge on tight priors, which
+        # drove the region-of-interest cells to the softplus floor (the cities zeroed out).
+        var_change = 0.0
+        if posterior_mean and (it % mean_every == 0 or step < tol):
             var_target = np.clip(np.diag(np.linalg.inv(data_hessian + inv_Sa))[:n_roi], 0.0, None)
+            var_prev = variance[:n_roi].copy()
             variance[:n_roi] = (1.0 - mean_relaxation) * variance[:n_roi] + mean_relaxation * var_target
-        if it > 0 and step < tol:
+            var_change = float(np.max(np.abs(variance[:n_roi] - var_prev)))
+        if it > 0 and step < tol and var_change < tol:
             break
 
     sf, deriv = field(z, variance)
