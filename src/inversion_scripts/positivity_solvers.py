@@ -21,10 +21,15 @@ off-diagonal correction) invert.py has already assembled.  Only the
 region-of-interest emission elements use the transform; the boundary-condition
 and OH elements stay in normal (linear) space.
 
-The posterior mean of a transformed Gaussian is not the transform of the mean, so
-with posterior_mean=True the reported scale factors are the true posterior mean
-(Gauss-Hermite quadrature), following the convention that the reported emissions
-are the posterior mean.
+Mean-vs-median convention (consistent with the lognormal solver and
+geoschem/integrated_methane_inversion#464): the physical simulation responds to the
+*mean* emissions, so with posterior_mean=True the forward-model residual and the Jacobian
+are evaluated at the posterior mean E[softplus(Z)] (Gauss-Hermite quadrature) -- carried in
+the iteration via field() -- not at the mode/median softplus(z).  Fitting the mode/median
+would bias the simulated concentrations low and inflate the posterior, the same bias PR #464
+corrects for the lognormal.  The posterior-mean variance is refreshed periodically within the
+iteration (as the lognormal refreshes its exp(0.5 sigma^2) mean correction), and the reported
+scale factors are that posterior mean.
 
 Diagnostics (DOFS, J_A/DOFS, J_O/(m-DOFS)) are reported from the *linear*
 averaging kernel A = (gamma K^T So^-1 K + Sa^-1)^-1 (gamma K^T So^-1 K), i.e. the
