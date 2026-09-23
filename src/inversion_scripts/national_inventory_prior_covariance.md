@@ -50,6 +50,24 @@ USA,Gas,0.25
   (`Country mask: Country 'XXX' not found ...; skipping`). If *no* group matches at all, the builder
   raises an error naming the likely cause (wrong `NationalPriorCountryNameColumn` or sector names).
 
+## Countries only partly in the domain (regional inversions)
+
+In a regional inversion (e.g. Nigeria) some countries lie only partly inside the domain. The reported
+BTR uncertainty is for the **whole** country, so pinning only the in-domain part to that whole-country
+total over-constrains it. Turn on the domain-invariant national term to correct this:
+
+```yaml
+NationalPriorDomainInvariant: true
+```
+
+This scales each country's national (rank-1) covariance by `1/f_C^2`, where `f_C` is the fraction of
+the country's area inside the domain (computed in an equal-area projection). A country fully inside the
+domain has `f_C = 1` (unchanged); a sliver has a very large national variance (i.e. its in-domain
+emissions are effectively not pinned to the national total, which is correct). `f_C` is an **area**
+fraction — a first-order stand-in for the in-domain **emission** fraction, which cannot be known from
+in-domain inputs alone. When this option is **off** and a matched country extends beyond the domain,
+the builder prints a `NOTE` recommending you enable it.
+
 ## Advanced options
 
 Use your own country boundaries instead of the bundle, or a precomputed gridded country mask:

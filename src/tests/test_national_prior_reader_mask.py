@@ -165,3 +165,32 @@ def test_unknown_country_raises():
     lat = np.arange(-5.0, 13.0, 1.0)
     with pytest.raises(ValueError):
         B.get_country_fraction_mask("ZZZ", lat, lon, shapes, "ISO3", area_weighting=False)
+
+
+def test_partial_country_warns_when_domain_invariant_off(capsys):
+    # A regional domain covering only part of a country (Nigeria-style) must warn that the national
+    # uncertainty is applied as if fully in-domain when NationalPriorDomainInvariant is off.
+    _load_shapes_or_skip()
+    xr = pytest.importorskip("xarray")
+    lon = np.arange(-76.0, -72.0, 0.5)   # a small window inside Colombia -> Colombia extends beyond
+    lat = np.arange(2.0, 6.0, 0.5)
+    prior = xr.Dataset(coords={"lat": lat, "lon": lon})
+    rows = [{"country_id": "COL", "country_name": "COL", "sector": "Oil", "relative_uncertainty": 0.3}]
+    config = {"NationalPriorCountryNameColumn": "ISO3", "NationalPriorDomainInvariant": False}
+    B.build_country_mask_from_shapes(rows, prior, config)
+    out = capsys.readouterr().out
+    assert "extend beyond the inversion domain" in out
+    assert "NationalPriorDomainInvariant" in out
+
+
+def test_no_partial_warning_when_domain_invariant_on(capsys):
+    # With domain-invariance ON the scaling is applied, so no "should have enabled it" warning.
+    _load_shapes_or_skip()
+    xr = pytest.importorskip("xarray")
+    lon = np.arange(-76.0, -72.0, 0.5)
+    lat = np.arange(2.0, 6.0, 0.5)
+    prior = xr.Dataset(coords={"lat": lat, "lon": lon})
+    rows = [{"country_id": "COL", "country_name": "COL", "sector": "Oil", "relative_uncertainty": 0.3}]
+    config = {"NationalPriorCountryNameColumn": "ISO3", "NationalPriorDomainInvariant": True}
+    B.build_country_mask_from_shapes(rows, prior, config)
+    assert "extend beyond the inversion domain" not in capsys.readouterr().out

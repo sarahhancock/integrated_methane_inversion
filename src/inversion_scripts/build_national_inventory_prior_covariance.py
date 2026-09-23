@@ -307,6 +307,34 @@ def build_country_mask_from_shapes(uncertainty_rows, prior, config):
         country_lookup[country_name] = country_id
         country_fraction[str(country_id)] = f_c               # str key: two_component_absolute looks up by str id
         row["country_id"] = str(country_id)
+
+    # Warn if a matched country extends beyond the inversion domain while domain-invariance is OFF:
+    # its national uncertainty is then applied as if the whole country were in-domain, which over-
+    # constrains the in-domain part (the Nigeria-style partially-in-domain case). A cheap geometry-
+    # bbox vs grid-bounds check -- no extra area computation.
+    domain_invariant_on = str(config.get("NationalPriorDomainInvariant", False)).strip().lower() in ("true", "1", "yes")
+    if not domain_invariant_on and country_lookup:
+        lon = prior.lon.values
+        lat = prior.lat.values
+        dlon = float(abs(lon[1] - lon[0])) if lon.size > 1 else 0.0
+        dlat = float(abs(lat[1] - lat[0])) if lat.size > 1 else 0.0
+        lon_lo, lon_hi = float(lon.min()) - dlon / 2, float(lon.max()) + dlon / 2
+        lat_lo, lat_hi = float(lat.min()) - dlat / 2, float(lat.max()) + dlat / 2
+        partial = []
+        for country_name in country_lookup:
+            geom = shapes[shapes[name_column] == country_name]
+            if geom.empty:
+                continue
+            minx, miny, maxx, maxy = geom.total_bounds
+            if (minx < lon_lo - 1e-6 or maxx > lon_hi + 1e-6
+                    or miny < lat_lo - 1e-6 or maxy > lat_hi + 1e-6):
+                partial.append(str(country_name))
+        if partial:
+            shown = ", ".join(partial[:6]) + (" ..." if len(partial) > 6 else "")
+            print(f"  NOTE: {len(partial)} matched country(ies) extend beyond the inversion domain "
+                  f"({shown}); with NationalPriorDomainInvariant off their national uncertainty is "
+                  f"applied as if fully in-domain. Set NationalPriorDomainInvariant: true to scale the "
+                  f"national term by the in-domain fraction (1/f_C^2).")
     return mask, country_fraction
 
 
