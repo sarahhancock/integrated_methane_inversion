@@ -10,11 +10,6 @@ from itertools import product
 from pathlib import Path
 from collections import defaultdict, deque
 try:
-    import scipy.sparse as _sp
-    _SCIPY_SPARSE_AVAILABLE = True
-except ImportError:
-    _SCIPY_SPARSE_AVAILABLE = False
-try:
     import scipy.optimize as _opt
     _SCIPY_OPTIMIZE_AVAILABLE = True
 except ImportError:
@@ -243,227 +238,6 @@ def invert_prior_covariance(Sa, Sa_constraint, use_full_prior_covariance):
 # REM diagonal So (obs_error_covariance/so_*.npz), built on individual observations.
 
 
-def build_sparse_so_correction(lat, lon, corr_params):
-    """Build the sparse off-diagonal correlation matrix P for So.
-
-    So = D (I + P) D  where D = diag(sqrt(so_diag)) and P_ij = rho(d_ij) for i != j.
-    Returns a scipy.sparse.csr_matrix or None if scipy.sparse is unavailable.
-
-    The first-order inverse approximation used in the inversion is:
-        (I + P)^{-1} approx I - P
-    which is accurate to O(A^2) where A is the correlation amplitude (typically ~0.1).
-
-    Three correlation forms are supported, selected by corr_params["form"]:
-      "two_exponential": A1*exp(-d/L1) + A2*exp(-d/L2) (short near-field term + broad
-                   same-day transport tail), NO taper, hard cutoff at corr_cutoff_km
-                   (= 3*L2).  This is the residual-error off-diagonal So model.
-      "empirical": smoothed binned lookup (empirical_d_km, empirical_rho) multiplied
-                   by a spherical C0 taper phi(u) = 1 - 1.5u + 0.5u^3, u = d/cutoff.
-      "exponential": parametric A * exp(-d/L) with hard cutoff.
-    The operator is diagnosed for positive semidefiniteness before use in either case.
-    """
-    if not _SCIPY_SPARSE_AVAILABLE:
-        print("Warning: scipy.sparse not available; off-diagonal So correction skipped.")
-        return None
-
-    cutoff_km = corr_params["corr_cutoff_km"]
-    form = corr_params.get("form", "exponential")
-    n = len(lat)
-
-    def _rho_values(dist_km):
-        if form == "two_exponential":
-            A1 = corr_params["corr_amplitude1"]; L1 = corr_params["corr_length1_km"]
-            A2 = corr_params["corr_amplitude2"]; L2 = corr_params["corr_length2_km"]
-            # no taper; the hard cutoff is applied by the neighbor search (<= cutoff_km)
-            return A1 * np.exp(-dist_km / L1) + A2 * np.exp(-dist_km / L2)
-        if form == "empirical":
-            d_arr   = corr_params["empirical_d_km"]
-            rho_arr = corr_params["empirical_rho"]
-            u = dist_km / cutoff_km
-            taper = np.where(u < 1.0, 1.0 - 1.5 * u + 0.5 * u ** 3, 0.0)
-            return np.interp(dist_km, d_arr, rho_arr, right=0.0) * taper
-        else:
-            A = corr_params["corr_amplitude"]
-            L = corr_params["corr_length_km"]
-            return A * np.exp(-dist_km / L)
-
-    # Keep A and L accessible for fallback path below (exponential branch only)
-    A = corr_params.get("corr_amplitude", 0.0)
-    L = corr_params.get("corr_length_km", 1.0)
-
-    # Find all observation pairs within the cutoff distance using a kd-tree.
-    # We use 3-D Cartesian coordinates on the unit sphere for the neighbor search
-    # (exact to < 0.1% for cutoffs up to 2000 km) then compute haversine distances
-    # for the correlation values.
-    lat_rad = np.deg2rad(lat)
-    lon_rad = np.deg2rad(lon)
-    xyz = np.column_stack([
-        np.cos(lat_rad) * np.cos(lon_rad),
-        np.cos(lat_rad) * np.sin(lon_rad),
-        np.sin(lat_rad),
-    ])
-    chord_cutoff = 2.0 * np.sin(np.deg2rad(cutoff_km / 111.32) / 2.0)
-
-    neighbor_k = corr_params.get("neighbor_k", None)
-    if neighbor_k not in (None, "", "None", False):
-        from scipy.spatial import cKDTree
-        k_query = min(max(int(neighbor_k) + 1, 2), n)
-        tree = cKDTree(xyz)
-        _, idx = tree.query(
-            xyz,
-            k=k_query,
-            distance_upper_bound=chord_cutoff,
-            workers=-1,
-        )
-        src = np.repeat(np.arange(n, dtype=np.int64), k_query)
-        dst = idx.reshape(-1).astype(np.int64)
-        valid = (dst < n) & (src != dst)
-        lo = np.minimum(src[valid], dst[valid])
-        hi = np.maximum(src[valid], dst[valid])
-        pairs = np.unique(np.column_stack([lo, hi]), axis=0)
-        if pairs.size == 0:
-            return _sp.csr_matrix((n, n), dtype=np.float32)
-        ii = pairs[:, 0].astype(np.int32)
-        jj = pairs[:, 1].astype(np.int32)
-        dlat = lat_rad[jj] - lat_rad[ii]
-        dlon = lon_rad[jj] - lon_rad[ii]
-        a = np.sin(dlat / 2)**2 + np.cos(lat_rad[ii]) * np.cos(lat_rad[jj]) * np.sin(dlon / 2)**2
-        dist_km_pairs = 2.0 * 6371.0 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
-        row_idx = np.concatenate([ii, jj])
-        col_idx = np.concatenate([jj, ii])
-        dist_km = np.concatenate([dist_km_pairs, dist_km_pairs])
-    else:
-        try:
-            from sklearn.neighbors import BallTree
-            X = np.column_stack([lat_rad, lon_rad])
-            tree = BallTree(X, metric="haversine")
-            cutoff_rad = cutoff_km / 6371.0
-            neighbor_inds, neighbor_dists = tree.query_radius(
-                X, r=cutoff_rad, return_distance=True, sort_results=False
-            )
-            # dists are in radians; convert to km
-            row_idx = np.concatenate([np.full(len(nb), i, dtype=np.int32) for i, nb in enumerate(neighbor_inds)])
-            col_idx = np.concatenate(neighbor_inds).astype(np.int32)
-            dist_km = np.concatenate(neighbor_dists) * 6371.0
-        except ImportError:
-            # Fallback: scipy cKDTree with Cartesian coordinates
-            from scipy.spatial import cKDTree
-            tree = cKDTree(xyz)
-            pairs = list(tree.query_pairs(chord_cutoff))
-            if not pairs:
-                return _sp.csr_matrix((n, n), dtype=np.float32)
-            ii, jj = zip(*pairs)
-            ii = np.array(ii, dtype=np.int32)
-            jj = np.array(jj, dtype=np.int32)
-            # haversine distances
-            dlat = lat_rad[jj] - lat_rad[ii]
-            dlon = lon_rad[jj] - lon_rad[ii]
-            a = np.sin(dlat / 2)**2 + np.cos(lat_rad[ii]) * np.cos(lat_rad[jj]) * np.sin(dlon / 2)**2
-            dist_km = 2.0 * 6371.0 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
-            # Build symmetric index arrays (both (i,j) and (j,i))
-            row_idx = np.concatenate([ii, jj])
-            col_idx = np.concatenate([jj, ii])
-            dist_km = np.concatenate([dist_km, dist_km])
-            # Remove self-pairs
-            not_self = row_idx != col_idx
-            row_idx, col_idx, dist_km = row_idx[not_self], col_idx[not_self], dist_km[not_self]
-
-    # Remove self-pairs and compute correlations
-    not_self = row_idx != col_idx
-    row_idx = row_idx[not_self]
-    col_idx = col_idx[not_self]
-    dist_km = dist_km[not_self]
-    rho_vals = _rho_values(dist_km).astype(np.float32)
-    P = _sp.csr_matrix((rho_vals, (row_idx, col_idx)), shape=(n, n))
-
-    max_abs_row_sum = corr_params.get("max_abs_row_sum", None)
-    if max_abs_row_sum not in (None, "", "None", False):
-        max_abs_row_sum = float(max_abs_row_sum)
-        row_sum = np.asarray(np.abs(P).sum(axis=1)).ravel()
-        current = float(row_sum.max()) if row_sum.size else 0.0
-        if current > max_abs_row_sum:
-            scale = max_abs_row_sum / current
-            P = P * scale
-            print(
-                "  Scaled off-diagonal So correlations to row-sum cap: "
-                f"{current:.3f} -> {max_abs_row_sum:.3f} (scale={scale:.4f})"
-            )
-    return P
-
-
-def diagnose_sparse_so_correction(P_corr, max_rows=2000):
-    """Return lightweight diagnostics for the sparse off-diagonal So operator."""
-    if P_corr is None:
-        return {"usable": False, "reason": "missing"}
-    nnz = int(P_corr.nnz)
-    n = int(P_corr.shape[0])
-    max_abs_row_sum = float(np.max(np.asarray(np.abs(P_corr).sum(axis=1)).ravel())) if n else 0.0
-    diagnostics = {
-        "usable": True,
-        "n": n,
-        "nnz": nnz,
-        "max_abs_row_sum": max_abs_row_sum,
-        "min_eig_I_plus_P_sample": np.nan,
-        "min_eig_I_minus_P_sample": np.nan,
-    }
-
-    if max_abs_row_sum >= 0.95:
-        diagnostics["usable"] = False
-        diagnostics["reason"] = "large row-sum; first-order inverse may be indefinite"
-        return diagnostics
-
-    sample_n = min(n, max_rows)
-    if sample_n > 1:
-        if sample_n < n:
-            sample_idx = np.linspace(0, n - 1, sample_n, dtype=int)
-            block = P_corr[sample_idx, :][:, sample_idx].toarray()
-        else:
-            block = P_corr.toarray()
-        block = 0.5 * (block + block.T)
-        eig_p = np.linalg.eigvalsh(block)
-        diagnostics["min_eig_I_plus_P_sample"] = float(1.0 + eig_p[0])
-        diagnostics["min_eig_I_minus_P_sample"] = float(1.0 - eig_p[-1])
-        if diagnostics["min_eig_I_plus_P_sample"] <= 0.0:
-            diagnostics["usable"] = False
-            diagnostics["reason"] = "sampled I+P is not positive definite"
-        elif diagnostics["min_eig_I_minus_P_sample"] <= 0.0:
-            diagnostics["usable"] = False
-            diagnostics["reason"] = "sampled first-order inverse I-P is not positive definite"
-
-    return diagnostics
-
-
-def apply_so_offdiag_correction(K, delta_y_vec, obs_diag, P_corr):
-    """Apply first-order off-diagonal So correction to KTinvSoK and KTinvSoyKxA.
-
-    The correction uses the Neumann-series first-order approximation:
-        So^{-1} approx D^{-2} - D^{-1} P D^{-1}
-    which is accurate to O(A^2) where A is the correlation amplitude (typically ~0.13).
-
-    Parameters
-    ----------
-    K          : (n_obs, n_elements) Jacobian matrix
-    delta_y_vec: (n_obs,) innovation vector y - K x_A
-    obs_diag   : (n_obs,) diagonal of So (variances, ppb^2)
-    P_corr     : (n_obs, n_obs) sparse off-diagonal correlation matrix
-
-    Returns
-    -------
-    correction_KTinvSoK   : (n_elements, n_elements) matrix correction
-    correction_KTinvSo_dy : (n_elements,)            vector correction
-    """
-    inv_sqrt_s = 1.0 / np.sqrt(obs_diag)
-    W = K * inv_sqrt_s[:, None]       # (n_obs, n_elements): K[i,:] / sqrt(s_i)
-    PW = P_corr @ W                   # (n_obs, n_elements): sparse × dense
-    correction_KTinvSoK = W.T @ PW   # (n_elements, n_elements)
-
-    weighted_dy = delta_y_vec * inv_sqrt_s   # (n_obs,)
-    P_dy = P_corr @ weighted_dy              # (n_obs,): sparse × dense
-    correction_KTinvSo_dy = W.T @ P_dy      # (n_elements,)
-
-    return correction_KTinvSoK, correction_KTinvSo_dy
-
-
 def _great_circle_km(lat1, lon1, lat2, lon2):
     """Great-circle distance in km (degree inputs)."""
     R = 6371.0
@@ -489,9 +263,9 @@ def build_offdiag_so_normal_equations(
     (LU); adjacent days are coupled at lag-1 correlation `temporal_rho` through a block-tridiagonal
     (Thomas) forward/back substitution, so the full n_obs x n_obs So is never assembled.
 
-    This is the SAME exact application used in the production inversion, and unlike the first-order
-    Woodbury correction it is valid for strong correlation (||P|| >> 1).  It needs per-observation
-    latitude, longitude, and date; use it on the merged monthly path (not the day-level streaming path).
+    This is the exact application used in the inversion (valid for strong correlation, ||P|| >> 1).
+    It needs per-observation latitude, longitude, and date; use it on the merged monthly path (not the
+    day-level streaming path).
     """
     import scipy.linalg as sla
     from scipy.spatial import cKDTree
@@ -586,24 +360,29 @@ def compute_so_normal_equations(K, delta_y_vec, obs_error, lat, lon, dates, so_c
         KTinvSoy = K^T So^-1 (y - F(xA))
         ytinvSoy = (y - F(xA))^T So^-1 (y - F(xA))
 
-    So is a SINGLE, solver-independent choice: a per-observation diagonal (obs_error) optionally
-    combined with a same-day off-diagonal correlation (so_corr_params). The two-exponential form is
-    applied EXACTLY (day-blocked block-Thomas); weaker empirical/single-exponential forms use the
-    first-order Woodbury correction; with so_corr_params=None it is the plain diagonal So. This is the
+    So is a SINGLE, solver-independent choice: a per-observation diagonal (obs_error), optionally
+    combined with a same-day two-exponential off-diagonal spatial correlation plus an adjacent-day
+    (lag-1) temporal correlation (so_corr_params with form "two_exponential"), applied EXACTLY by a
+    day-blocked block-Thomas solve. With so_corr_params=None it is the plain diagonal So. This is the
     ONE place So^-1 is applied, so every solver sees identical observation weighting.
     Returns (KTinvSoK, KTinvSoy, ytinvSoy).
     """
     K = np.asarray(K, dtype=float)
     delta_y_vec = np.asarray(delta_y_vec, dtype=float)
     obs_error = np.asarray(obs_error, dtype=float)
-    form = so_corr_params.get("form") if so_corr_params is not None else None
-    if form == "two_exponential" and not (lat is not None and lon is not None and dates is not None):
+    form = so_corr_params.get("form") if so_corr_params else None
+    if form is not None and form != "two_exponential":
         raise ValueError(
-            "Off-diagonal So (two-exponential) requires per-observation lat, lon, and dates for the "
-            "exact day-blocked solve. Provide observation metadata (merged monthly path)."
+            f"Unsupported off-diagonal So form {form!r}. The only supported off-diagonal model is the "
+            "two-exponential spatial correlation + adjacent-day temporal correlation "
+            "(so_corr_params['form'] = 'two_exponential'); set OffDiagonalObsCov: false for a diagonal So."
         )
-    exact_offdiag = so_corr_params is not None and form == "two_exponential"
-    if exact_offdiag:
+    if form == "two_exponential":
+        if not (lat is not None and lon is not None and dates is not None):
+            raise ValueError(
+                "Off-diagonal So (two-exponential) requires per-observation lat, lon, and dates for the "
+                "exact day-blocked solve. Provide observation metadata (merged monthly path)."
+            )
         temporal_rho = float(so_corr_params.get("temporal_rho", 0.0))
         KTinvSoK, KTinvSoy, ytinvSoy = build_offdiag_so_normal_equations(
             K, delta_y_vec, obs_error, lat, lon, dates, so_corr_params, temporal_rho=temporal_rho,
@@ -613,43 +392,11 @@ def compute_so_normal_equations(K, delta_y_vec, obs_error, lat, lon, dates, so_c
               f"A2={so_corr_params['corr_amplitude2']:.3f} L2={so_corr_params['corr_length2_km']:.0f} km, "
               f"no taper, cutoff={so_corr_params['corr_cutoff_km']:.0f} km, temporal_rho={temporal_rho})")
     else:
-        # Diagonal So, with an optional first-order (Woodbury) off-diagonal correction (weak correlation only).
+        # Plain diagonal So (no off-diagonal correlation).
         KTinvSo = K.transpose() / obs_error
         KTinvSoK = KTinvSo @ K
         KTinvSoy = KTinvSo @ delta_y_vec
         ytinvSoy = float(delta_y_vec @ (delta_y_vec / obs_error))
-        if so_corr_params is not None and lat is not None and lon is not None:
-            P_corr = build_sparse_so_correction(lat, lon, so_corr_params)
-            if P_corr is not None:
-                diag = diagnose_sparse_so_correction(P_corr)
-                print(
-                    "  Off-diagonal So diagnostics: "
-                    f"nnz={diag['nnz']:,}, max_abs_row_sum={diag['max_abs_row_sum']:.3f}, "
-                    f"min_eig(I+P) sample={diag['min_eig_I_plus_P_sample']:.3e}, "
-                    f"min_eig(I-P) sample={diag['min_eig_I_minus_P_sample']:.3e}"
-                )
-                if not diag["usable"]:
-                    print(
-                        "Warning: skipping off-diagonal So correction because "
-                        f"{diag.get('reason', 'diagnostics failed')}. Using diagonal So."
-                    )
-                    P_corr = None
-            if P_corr is not None:
-                corr_KTinvSoK, corr_KTinvSo_dy = apply_so_offdiag_correction(
-                    K, delta_y_vec, obs_error, P_corr
-                )
-                inv_sqrt_s = 1.0 / np.sqrt(obs_error)
-                weighted_dy = delta_y_vec * inv_sqrt_s
-                KTinvSoK = KTinvSoK - corr_KTinvSoK
-                KTinvSoy = KTinvSoy - corr_KTinvSo_dy
-                ytinvSoy = ytinvSoy - float(weighted_dy @ (P_corr @ weighted_dy))
-                if form == "empirical":
-                    print(f"  Off-diagonal So correction applied (first-order, "
-                          f"empirical rho, cutoff={so_corr_params['corr_cutoff_km']:.0f} km)")
-                else:
-                    print(f"  Off-diagonal So correction applied (first-order, "
-                          f"A={so_corr_params.get('corr_amplitude', float('nan')):.3f}, "
-                          f"L={so_corr_params.get('corr_length_km', float('nan')):.0f} km)")
     return KTinvSoK, KTinvSoy, ytinvSoy
 
 
@@ -674,12 +421,9 @@ def solve_inversion_from_k(
 ):
     """Solve the inversion once K, y-F(xA), and So are already assembled.
 
-    When so_corr_params is provided (a dict with corr_amplitude, corr_length_km,
-    corr_cutoff_km) and delta_y contains 'lat' and 'lon' keys, the inversion
-    applies a first-order correction for off-diagonal So:
-        So^{-1} approx D^{-2} - D^{-1} P D^{-1}
-    where P is the sparse off-diagonal correlation matrix.  This is accurate
-    to O(A^2) where A = corr_amplitude (typically ~0.13).
+    When so_corr_params is provided (the two-exponential off-diagonal So model, with per-observation
+    lat/lon/dates) the observation weighting So^-1 is applied EXACTLY via compute_so_normal_equations
+    (day-blocked block-Thomas); otherwise So is the plain per-observation diagonal.
     """
     optimize_bc = prior_err_bc > 0.0
     optimize_oh = prior_err_oh > 0.0
@@ -1637,7 +1381,7 @@ if __name__ == "__main__":
                 "corr_amplitude2": float(config.get("OffDiagonalObsCovA2", 0.459)),
                 "corr_length2_km": L2,
                 "corr_cutoff_km": float(config.get("OffDiagonalObsCovCutoffKm", 3.0 * L2)),
-                "temporal_rho": float(config.get("OffDiagonalObsCovTemporalRho", 0.19)),
+                "temporal_rho": float(config.get("OffDiagonalObsCovTemporalRho", 0.17)),
             }
             print(
                 f"Off-diagonal So enabled: two-exponential "

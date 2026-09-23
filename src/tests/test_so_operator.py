@@ -72,9 +72,20 @@ def test_no_corr_params_is_plain_diagonal():
 def test_two_exponential_requires_metadata():
     # the exact day-blocked two-exponential solve needs lat/lon/dates; without them it must raise.
     K = np.ones((4, 2)); dy = np.ones(4); so = np.ones(4)
-    params = dict(_SA_PARAMS, temporal_rho=0.19)
+    params = dict(_SA_PARAMS, temporal_rho=0.17)
     with pytest.raises(ValueError):
         compute_so_normal_equations(K, dy, so, None, None, None, params)
+
+
+def test_unsupported_form_raises():
+    # two_exponential is the only supported off-diagonal So model; any other form must raise
+    # (rather than silently degrade), so an unintended config surfaces immediately.
+    K = np.ones((4, 2)); dy = np.ones(4); so = np.ones(4)
+    lat = np.array([-10.0, -10.1, -9.9, -10.2]); lon = np.array([-60.0, -60.1, -59.9, -60.2])
+    for bad in ({"form": "exponential", "corr_amplitude": 0.1, "corr_length_km": 200.0, "corr_cutoff_km": 1500.0},
+                {"form": "empirical", "corr_cutoff_km": 375.0}):
+        with pytest.raises(ValueError):
+            compute_so_normal_equations(K, dy, so, lat, lon, None, bad)
 
 
 def _obs_cluster(seed, n, day_index):
@@ -111,8 +122,8 @@ def test_two_exponential_matches_dense_with_temporal():
     n = 16
     day_index = np.array([0] * 8 + [1] * 8)
     lat, lon, dates, di, K, dy, so = _obs_cluster(23, n, day_index)
-    params = dict(_SA_PARAMS, temporal_rho=0.19)
-    So = _dense_so(lat, lon, di, so, params, temporal_rho=0.19)
+    params = dict(_SA_PARAMS, temporal_rho=0.17)
+    So = _dense_so(lat, lon, di, so, params, temporal_rho=0.17)
     Sinv = np.linalg.inv(So)
     KTinvSoK, KTinvSoy, ytinvSoy = compute_so_normal_equations(K, dy, so, lat, lon, dates, params)
     assert np.allclose(KTinvSoK, K.T @ Sinv @ K, atol=1e-8)
@@ -125,41 +136,8 @@ def test_two_exponential_nonadjacent_days_decouple():
     n = 12
     day_index = np.array([0] * 6 + [2] * 6)     # gap of 2 -> no temporal coupling
     lat, lon, dates, di, K, dy, so = _obs_cluster(31, n, day_index)
-    params = dict(_SA_PARAMS, temporal_rho=0.19)
-    So = _dense_so(lat, lon, di, so, params, temporal_rho=0.19)   # lag>=2 -> block-diagonal
+    params = dict(_SA_PARAMS, temporal_rho=0.17)
+    So = _dense_so(lat, lon, di, so, params, temporal_rho=0.17)   # lag>=2 -> block-diagonal
     Sinv = np.linalg.inv(So)
     KTinvSoK, _, _ = compute_so_normal_equations(K, dy, so, lat, lon, dates, params)
     assert np.allclose(KTinvSoK, K.T @ Sinv @ K, atol=1e-8)
-
-
-def test_first_order_exponential_correction_matches_neumann():
-    # The non-two_exponential forms use the first-order (Woodbury) inverse So^-1 ~ D^-2 - D^-1 P D^-1,
-    # so KTinvSoK = K^T diag(1/so) K - W^T P W with W = K/sqrt(so), P_ij = A exp(-d/L) for d <= cutoff.
-    # Weak amplitude + tight cluster keeps I-P positive definite so the correction is actually applied.
-    n = 12
-    day_index = np.zeros(n, dtype=int)
-    lat, lon, _, _, K, dy, so = _obs_cluster(41, n, day_index)   # ~ +/- 220 km cluster, all within cutoff
-    params = {"form": "exponential", "corr_amplitude": 0.05, "corr_length_km": 150.0, "corr_cutoff_km": 1500.0}
-    KTinvSoK, KTinvSoy, ytinvSoy = compute_so_normal_equations(K, dy, so, lat, lon, None, params)
-
-    # dense P built exactly as build_sparse_so_correction does (haversine <= cutoff, rho stored float32)
-    P = np.zeros((n, n))
-    for i in range(n):
-        for j in range(n):
-            if i == j:
-                continue
-            d = _great_circle_km(lat[i], lon[i], lat[j], lon[j])
-            if d <= 1500.0:
-                P[i, j] = np.float32(0.05 * np.exp(-d / 150.0))
-    inv = 1.0 / so
-    isq = 1.0 / np.sqrt(so)
-    W = K * isq[:, None]
-    wdy = dy * isq
-    ref_KTinvSoK = K.T @ (K * inv[:, None]) - W.T @ (P @ W)
-    ref_KTinvSoy = K.T @ (dy * inv) - W.T @ (P @ wdy)
-    ref_ytinvSoy = float(dy @ (dy * inv) - wdy @ (P @ wdy))
-    # the correction must actually be applied (result differs from the plain diagonal)
-    assert not np.allclose(KTinvSoK, K.T @ (K * inv[:, None]))
-    assert np.allclose(KTinvSoK, ref_KTinvSoK, atol=1e-5)
-    assert np.allclose(KTinvSoy, ref_KTinvSoy, atol=1e-5)
-    assert np.isclose(ytinvSoy, ref_ytinvSoy, atol=1e-5)

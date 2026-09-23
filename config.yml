@@ -209,7 +209,7 @@ OffDiagonalObsCovA1: 0.385           # Default 0.385 from Hancock South America 
 OffDiagonalObsCovL1: 26.0            # Default 26.0 km from Hancock South America work
 OffDiagonalObsCovA2: 0.459           # Default 0.459 from Hancock South America work
 OffDiagonalObsCovL2: 398.0           # Default 398.0 km from Hancock South America work
-OffDiagonalObsCovTemporalRho: 0.19   # Default 0.19 from Hancock South America work
+OffDiagonalObsCovTemporalRho: 0.17   # Default 0.17 (empirical adjacent-day obs-error lag-1, Hancock South America work)
 ## OffDiagonalObsCovCutoffKm: 1194   # spatial cutoff (km); default = 3 * L2
 
 ## Setup modules

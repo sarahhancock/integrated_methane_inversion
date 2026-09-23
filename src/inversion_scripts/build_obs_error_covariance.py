@@ -829,14 +829,13 @@ def main():
         source_files=np.asarray(files),
     )
 
-    # Spatial correlation parameters
-    # Off-diagonal So correlation model.  When the two-exponential fit (short near-field
-    # term + broad same-day transport tail) is available it is the model invert.py applies,
-    # with NO taper and a cutoff of 3*L2 (captures ~95% of the correlation mass, including
-    # the transport tail that a short cutoff would discard).  The smoothed empirical lookup
-    # and the single-exponential fit are kept as fallbacks / diagnostics.  The inversion
-    # code still checks the sparse correlation operator for positive semidefiniteness.
-    EMPIRICAL_CUTOFF_KM = 375.0  # fallback cutoff for the empirical lookup only
+    # Spatial correlation parameters (DIAGNOSTIC record; the inversion reads the off-diagonal So
+    # correlation from the OffDiagonalObsCov* config keys, not this file).  The production model is
+    # the two-exponential fit (short near-field term + broad same-day transport tail), applied with
+    # NO taper and a cutoff of 3*L2 (captures ~95% of the correlation mass, including the transport
+    # tail a short cutoff would discard).  The binned empirical correlation is saved alongside it for
+    # the validation figures.
+    EMPIRICAL_CUTOFF_KM = 375.0  # cutoff for the empirical binning when no two-exponential fit
     two_exp = fit_results.get("two_exponential") if fit_results else None
     cutoff_km = float(3.0 * two_exp["length2_km"]) if two_exp is not None else EMPIRICAL_CUTOFF_KM
 
@@ -871,31 +870,18 @@ def main():
             corr_length1_km=np.float32(two_exp["length1_km"]),
             corr_amplitude2=np.float32(two_exp["amplitude2"]),
             corr_length2_km=np.float32(two_exp["length2_km"]),
-            # single-exponential kept as diagnostic / fallback
-            corr_amplitude=np.float32(fit_results.get("exponential", {}).get("amplitude", np.nan)),
-            corr_length_km=np.float32(fit_results.get("exponential", {}).get("length_km", np.nan)),
             **common,
         )
         print(f"  Saved two-exponential off-diagonal So: "
               f"A1={two_exp['amplitude1']:.3f} L1={two_exp['length1_km']:.0f} km, "
               f"A2={two_exp['amplitude2']:.3f} L2={two_exp['length2_km']:.0f} km, "
               f"no taper, cutoff={cutoff_km:.0f} km")
-    elif fit_results and "exponential" in fit_results:
-        exp_params = fit_results["exponential"]
-        np.savez(
-            corr_path,
-            functional_form=np.bytes_("empirical"),
-            corr_amplitude=np.float32(exp_params["amplitude"]),
-            corr_length_km=np.float32(exp_params["length_km"]),
-            gaussian_amplitude=np.float32(fit_results.get("gaussian", {}).get("amplitude", np.nan)),
-            gaussian_length_km=np.float32(fit_results.get("gaussian", {}).get("length_km", np.nan)),
-            **common,
-        )
-        print(f"  Saved empirical correlation (single-exp fallback): {len(emp_d)} bins up to "
-              f"{cutoff_km:.0f} km, A={exp_params['amplitude']:.3f}, L={exp_params['length_km']:.1f} km")
     elif np.any(np.isfinite(emp_rho) & (emp_rho > 0)):
+        # Two-exponential fit unavailable -> save the binned empirical correlation as a diagnostic
+        # (the inversion still reads its correlation from the OffDiagonalObsCov* config keys).
         np.savez(corr_path, functional_form=np.bytes_("empirical"), **common)
-        print(f"  Saved empirical correlation (no parametric fit): {len(emp_d)} bins")
+        print(f"  Two-exponential fit unavailable; saved empirical correlation bins only "
+              f"({len(emp_d)} bins up to {cutoff_km:.0f} km) as a diagnostic.")
     else:
         print("  Skipping correlation params save (insufficient data)")
 
