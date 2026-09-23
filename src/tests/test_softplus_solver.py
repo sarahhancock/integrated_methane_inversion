@@ -74,6 +74,20 @@ def test_returns_normal_averaging_kernel():
     assert np.isclose(np.trace(A[:n, :n]), diag["DOFS"], atol=1e-6)   # DOFS = trace of the ROI AK
 
 
+def test_max_iter_backstop_warns_loudly(capsys):
+    # Default max_iter is None (run to convergence, no cap). A set max_iter is only a safety backstop:
+    # reaching it without convergence must print a loud warning and return, not stop silently.
+    n, n_obs = 5, 400
+    delta_true = np.array([0.2, -0.25, 0.1, 0.3, -0.15])
+    K, xa, KTinvSoK, KTinvSoy, ytinvSoy, inv_Sa = _linear_problem(n, n_obs, 1, delta_true)
+    # max_iter=1 cannot converge (the convergence test requires it > 0), so it always hits the backstop
+    _, _, _, _, _, n_iter = run_softplus(
+        KTinvSoK, KTinvSoy, ytinvSoy, inv_Sa, inv_Sa, n_obs, n, xa, scale=0.1, max_iter=1
+    )
+    assert n_iter == 1
+    assert "did not converge" in capsys.readouterr().out
+
+
 def test_enforces_positivity_where_linear_goes_negative():
     n, n_obs = 4, 400
     delta_true = np.array([-2.5, 0.2, 0.1, 0.0])  # element 0 drives the linear scale factor negative

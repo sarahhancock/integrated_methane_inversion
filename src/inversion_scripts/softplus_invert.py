@@ -124,7 +124,7 @@ def run_softplus(
     posterior_mean=True,
     mean_relaxation=0.5,
     mean_every=20,
-    max_iter=500,
+    max_iter=None,
     tol=5e-3,
 ):
     """Softplus-positivity inversion in normal-equation (KTinvSoK, KTinvSoy) space.
@@ -142,6 +142,9 @@ def run_softplus(
       scale             : softplus smoothing scale s (smaller -> closer to ReLU).
       gamma, kappa      : regularization factor and LM damping (Chen et al. kappa=10).
       posterior_mean    : report the posterior mean (Gauss-Hermite) rather than the mode.
+      max_iter          : None (default) iterates to convergence with NO cap, like the lognormal
+                          solver. If set, it is a safety backstop: reaching it without convergence
+                          prints a loud warning and returns the current iterate (never a silent stop).
 
     Returns xhat, delta, S_post, A, diagnostics, n_iter.
     """
@@ -168,8 +171,13 @@ def run_softplus(
             deriv[:n_roi] = softplus_derivative(state[:n_roi], scale)
         return scale_factors, deriv
 
+    # Iterate to convergence. Like the lognormal solver there is no fixed iteration cap by default
+    # (max_iter=None): the loop runs until the region-of-interest scale factors AND the posterior-mean
+    # variance both stop changing (step, var_change < tol). A max_iter, if given, is only a safety
+    # backstop -- reaching it prints a loud non-convergence warning and returns the current iterate.
     n_iter = 0
-    for it in range(max_iter):
+    it = 0
+    while True:
         n_iter = it + 1
         sf, deriv = field(z, variance)
         data_hessian = Md * np.outer(deriv, deriv)
@@ -182,7 +190,7 @@ def run_softplus(
         step = np.max(np.abs(sf_new[:n_roi] - sf[:n_roi]) / np.maximum(sf[:n_roi], 1e-9))
         z = z_new
         # Update the posterior-mean variance only periodically (mirrors the lognormal solver's
-        # mean-correction c, refreshed every MF_EVERY iterations): holding the variance fixed
+        # mean-correction c, refreshed every mean_every iterations): holding the variance fixed
         # between updates lets the mode iteration settle.  Updating it every iteration -- the
         # previous behaviour -- chased a moving mean and did not converge on tight priors, which
         # drove the region-of-interest cells to the softplus floor (the cities zeroed out).
@@ -194,6 +202,12 @@ def run_softplus(
             var_change = float(np.max(np.abs(variance[:n_roi] - var_prev)))
         if it > 0 and step < tol and var_change < tol:
             break
+        if max_iter is not None and n_iter >= max_iter:
+            print(f"WARNING: softplus solver did not converge in {max_iter} iterations "
+                  f"(step={step:.2e}, var_change={var_change:.2e}, tol={tol:.1e}); "
+                  f"returning the current iterate.")
+            break
+        it += 1
 
     sf, deriv = field(z, variance)
     data_hessian = Md * np.outer(deriv, deriv)
