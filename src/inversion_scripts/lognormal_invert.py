@@ -183,11 +183,12 @@ def lognormal_invert(config, state_vector_filepath, jacobian_sf):
     # Calculate the difference between tropomi and the background
     # simulation, which has no emissions
     y_ybkg_diff = y - ybkg
-    ybkg, y, y_ybkg_diff = (
-        np.swapaxes(ybkg, 0, 1),
-        np.swapaxes(y, 0, 1),
-        np.swapaxes(y_ybkg_diff, 0, 1),
-    )
+    # merge_partial_k stores obs_satellite / gc_bkgd as 1-D (m,) vectors; the Levenberg-Marquardt
+    # code below operates on column vectors (m, 1). reshape(-1, 1) yields the column vector the old
+    # np.asmatrix + swapaxes contract produced, and is robust to a legacy (1, m) save as well.
+    ybkg = ybkg.reshape(-1, 1)
+    y = y.reshape(-1, 1)
+    y_ybkg_diff = y_ybkg_diff.reshape(-1, 1)
 
     # fixed kappa of 10 following Chen et al., 2022 https://doi.org/10.5194/acp-22-10809-2022
     kappa = 10
