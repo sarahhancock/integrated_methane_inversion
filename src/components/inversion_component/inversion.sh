@@ -39,6 +39,11 @@ setup_inversion() {
     cp ${InversionPath}/src/inversion_scripts/build_length_scale_prior_covariance.py inversion/
     cp ${InversionPath}/src/inversion_scripts/build_national_inventory_prior_covariance.py inversion/
     cp ${InversionPath}/src/inversion_scripts/build_sector_ensemble_prior_covariance.py inversion/
+    cp ${InversionPath}/src/inversion_scripts/build_obs_error_covariance.py inversion/
+    # Bundled global admin-0 country shapefile -> per-country masks for the national-inventory Sa
+    # (build_national_inventory_prior_covariance.default_country_shapefile finds it here in the run dir)
+    mkdir -p inversion/resources/countries
+    cp ${InversionPath}/resources/countries/imi_country_boundaries.* inversion/resources/countries/
     cp ${InversionPath}/src/notebooks/visualization_notebook.ipynb inversion/
     cp ${InversionPath}/src/utilities/cleanup_script.sh .
     cp ${InversionPath}/src/utilities/config_utils.py inversion/

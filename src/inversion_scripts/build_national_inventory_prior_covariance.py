@@ -124,26 +124,51 @@ def sector_key(field):
 
 
 def read_uncertainty_table(path):
+    """Read a per-(country, sector) relative-uncertainty CSV. Columns are flexible so any IMI user's
+    file works: the uncertainty column may be 'relative_uncertainty' | 'u' | 'uncertainty'; the country
+    identifier may be 'country_id' | 'iso3' | 'country' | 'country_name'. ISO3 codes are matched to the
+    bundled shapefile's ISO3 column (set NationalPriorCountryNameColumn: ISO3); country names match its
+    NAME column. Sector is 'sector'. Returns rows {country_id, country_name, sector, relative_uncertainty}."""
     rows = []
     with open(path, "r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
-        required = {"sector", "relative_uncertainty"}
-        missing = required - set(reader.fieldnames or [])
-        if missing:
+        # Map normalized (stripped, lowercased) header -> original header, so header casing/whitespace
+        # (e.g. "ISO3, Sector, U") is tolerated. Row access uses the original field names.
+        norm = {}
+        for fn in (reader.fieldnames or []):
+            norm.setdefault(str(fn).strip().lower(), fn)
+        unc_key = next((k for k in ("relative_uncertainty", "u", "uncertainty") if k in norm), None)
+        id_keys = [k for k in ("country_id", "iso3", "country", "country_name") if k in norm]
+        if "sector" not in norm or unc_key is None:
             raise ValueError(
-                f"{path} missing required columns: {', '.join(sorted(missing))}"
+                f"{path} must have a 'sector' column and an uncertainty column "
+                f"(relative_uncertainty | u | uncertainty); found {list(reader.fieldnames or [])}"
             )
+        if not id_keys:
+            raise ValueError(
+                f"{path} must have a country identifier (country_id | iso3 | country | country_name); "
+                f"found {list(reader.fieldnames or [])}"
+            )
+        unc_col, sector_col = norm[unc_key], norm["sector"]
+        id_cols = [norm[k] for k in id_keys]
+        name_col = norm.get("country", norm.get("country_name"))
         for row in reader:
-            country_id = str(row.get("country_id", "")).strip()
-            country_name = str(row.get("country", row.get("country_name", ""))).strip()
-            if not (country_id or country_name) or not row.get("sector"):
+            ident = next((str(row.get(c, "")).strip() for c in id_cols if str(row.get(c, "")).strip()), "")
+            country_name = (str(row.get(name_col, "")).strip() if name_col else "") or ident
+            unc = str(row.get(unc_col, "")).strip()
+            if not ident or not str(row.get(sector_col, "")).strip() or unc == "":
+                continue
+            try:
+                unc_val = float(unc)
+            except ValueError:
+                print(f"  {path}: non-numeric uncertainty {unc!r} for {ident}/{row.get(sector_col)}; skipping.")
                 continue
             rows.append(
                 {
-                    "country_id": country_id or country_name,
+                    "country_id": ident,
                     "country_name": country_name,
-                    "sector": str(row["sector"]).strip(),
-                    "relative_uncertainty": float(row["relative_uncertainty"]),
+                    "sector": str(row[sector_col]).strip(),
+                    "relative_uncertainty": unc_val,
                 }
             )
     if not rows:
@@ -177,7 +202,12 @@ def get_country_fraction_mask(country, lat, lon, shapes, name_column, area_weigh
         raise ValueError(f"Country {country!r} not found in shapefile column {name_column!r}")
 
     if not area_weighting:
-        mask = np.array(regionmask.mask_geopandas(country_shape, lon, lat) + 1)
+        import warnings
+        with warnings.catch_warnings():
+            # a country outside the inversion domain legitimately covers no gridpoints (e.g. a global BTR
+            # CSV run over a regional domain) -- silence regionmask's expected all-NaN warning.
+            warnings.filterwarnings("ignore", message="No gridpoint belongs to any region")
+            mask = np.array(regionmask.mask_geopandas(country_shape, lon, lat) + 1)
         mask[np.isnan(mask)] = 0
         mask[mask > 0] = 1
         return mask.astype(float), 1.0            # binary: in-domain fraction unknown -> f_C=1 (no scaling)
@@ -191,8 +221,12 @@ def get_country_fraction_mask(country, lat, lon, shapes, name_column, area_weigh
             grid_cells.append(box(x - dlon / 2, y - dlat / 2, x + dlon / 2, y + dlat / 2))
             indices.append((i, j))
 
-    grid = gpd.GeoDataFrame(geometry=grid_cells, crs="EPSG:4326").to_crs(shapes.crs)
-    country_projected = country_shape.to_crs(shapes.crs)
+    # Compute areas in an equal-area CRS (EPSG:6933, global cylindrical equal-area), NOT the shapefile's
+    # geographic CRS: square-degrees over-weight high latitudes by ~1/cos(lat), which would bias both the
+    # per-cell coverage fraction and the domain-invariant f_C for countries spanning a wide latitude range.
+    EQUAL_AREA_CRS = "EPSG:6933"
+    grid = gpd.GeoDataFrame(geometry=grid_cells, crs="EPSG:4326").to_crs(EQUAL_AREA_CRS)
+    country_projected = country_shape.to_crs(EQUAL_AREA_CRS)
     mask = np.zeros((len(lat), len(lon)), dtype=float)
     indomain_area = 0.0
     for geom, (i, j) in zip(grid.geometry, indices):
@@ -208,10 +242,31 @@ def get_country_fraction_mask(country, lat, lon, shapes, name_column, area_weigh
     return mask, min(max(f_c, 0.0), 1.0)
 
 
+def default_country_shapefile():
+    """Path to the global admin-0 country shapefile bundled with the IMI (resources/countries/, with
+    NAME + ISO3 columns). Resolved from IMI_COUNTRY_SHAPEFILE or relative to this file's repo location;
+    returns None if not found (e.g. the script was copied to a run dir without resources/)."""
+    env = os.environ.get("IMI_COUNTRY_SHAPEFILE")
+    if env and os.path.exists(env):
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (
+        os.path.join(here, "resources", "countries", "imi_country_boundaries.shp"),   # copied beside a run-dir script
+        os.path.normpath(os.path.join(here, "..", "..", "resources", "countries", "imi_country_boundaries.shp")),  # in-repo
+    ):
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
 def build_country_mask_from_shapes(uncertainty_rows, prior, config):
-    shapefile = config.get("NationalPriorCountryShapefile")
+    # Default to the bundled global shapefile so any IMI user gets per-country masks with no setup.
+    shapefile = config.get("NationalPriorCountryShapefile") or default_country_shapefile()
     name_column = config.get("NationalPriorCountryNameColumn", "NAME")
-    area_weighting = bool(config.get("NationalPriorCountryMaskAreaWeighting", True))
+    # Area-weighted per-cell coverage is only needed for the domain-invariant f_C (1/f_C^2); otherwise
+    # use the fast regionmask path (f_C=1). Default follows NationalPriorDomainInvariant.
+    domain_invariant = str(config.get("NationalPriorDomainInvariant", False)).strip().lower() in ("true", "1", "yes")
+    area_weighting = bool(config.get("NationalPriorCountryMaskAreaWeighting", domain_invariant))
     if not shapefile:
         return None, None
 
@@ -231,15 +286,19 @@ def build_country_mask_from_shapes(uncertainty_rows, prior, config):
             row["country_id"] = str(country_lookup[country_name])
             continue
         country_id = int(row["country_id"]) if str(row["country_id"]).isdigit() else next_id
+        try:
+            fraction, f_c = get_country_fraction_mask(
+                country_name,
+                prior.lat.values,
+                prior.lon.values,
+                shapes,
+                name_column,
+                area_weighting=area_weighting,
+            )
+        except ValueError as exc:
+            print(f"  Country mask: {exc}; skipping {country_name!r}.")
+            continue
         next_id = max(next_id, country_id + 1)
-        fraction, f_c = get_country_fraction_mask(
-            country_name,
-            prior.lat.values,
-            prior.lon.values,
-            shapes,
-            name_column,
-            area_weighting=area_weighting,
-        )
         current = mask.values
         replace = fraction > best_fraction                    # assign each cell to the country covering the MOST of it
         current[replace] = country_id
@@ -386,26 +445,21 @@ def two_component_absolute(
     grid_national_ratio=2.5, min_uncertainty=0.30, global_background=None,
     country_fraction=None,
 ):
-    """Prior error covariance in ABSOLUTE emission^2 units, as a sum of three nested, independent
-    error components (a variance-components / random-effects model). For two cells i, j of one sector:
+    """Prior error covariance in ABSOLUTE emission^2 units, as a sum of independent error components
+    (a variance-components / random-effects model). For two cells i, j of one sector within a country:
 
-        GLOBAL    g_s^2   * E_i E_j     for EVERY pair (all countries)          <- Saunois systematic
-        NATIONAL  snat^2  * E_i E_j     only for pairs in the SAME country       <- BTR national error
-        LOCAL     snat^2 (ratio_i^2-1) * E_i^2   on the diagonal only            <- grid-scale wiggle
-
-    so   within a country :  Sa_ij = (g_s^2 + snat^2) E_i E_j   (+ LOCAL on the diagonal)
-         across countries :  Sa_ij =  g_s^2          E_i E_j.
+        NATIONAL  snat^2  * E_i E_j              (fully correlated across the country)  <- BTR national error
+        LOCAL     snat^2 (ratio_i^2-1) * E_i^2   on the diagonal only                   <- grid-scale wiggle
+        FLOOR     g_floor^2 * E_i E_j            (only where u_BTR < g_s)               <- Saunois global floor
 
     ratio_i = sqrt(1 + (R01^2 - 1)/n_eff_i) is the grid:national error ratio (n_eff_i = effective number
-    of independent native cells in element i). The GLOBAL systematic g_s = global_background[sector] (a
-    genuine Saunois global uncertainty) is common to every cell of the sector everywhere, so the
-    continental/global aggregate never averages below g_s. To keep the NATIONAL aggregate EXACTLY u_BTR,
-    g_s is PEELED from u_BTR in quadrature: the national+local part uses the residual
-        u_res = sqrt(u_BTR^2 - g_s^2),   snat = u_res / sqrt(1 + Q),   Q = sum_i (ratio_i^2-1) E_i^2 / E_c^2,
-    so within a country GLOBAL + NATIONAL + LOCAL sum back to u_BTR exactly. This needs g_s <= u_BTR,
-    which genuine Saunois values always satisfy against the 30% BTR floor; if a sector ever has g_s >
-    u_BTR the residual clips to 0 (that country's error becomes fully global and its aggregate rises to
-    g_s > u_BTR, flagged in the diagnostics). global_background=None (or g_s=0) recovers the plain
+    of independent native cells in element i). The national+local part uses the FULL u_BTR (no peel):
+        snat = u_BTR / sqrt(1 + Q),   Q = sum_i (ratio_i^2 - 1) E_i^2 / E_c^2,
+    so NATIONAL + LOCAL give a national aggregate of exactly u_BTR. The Saunois global value
+    g_s = global_background[sector] is a FLOOR: it ADDS a within-country rank-1 with amplitude
+    g_floor = sqrt(max(g_s^2 - u_BTR^2, 0)) ONLY where u_BTR < g_s, raising the national aggregate to
+    max(u_BTR, g_s) and never reducing the national/local grid structure (where u_BTR >= g_s nothing is
+    added, so no double-counting). global_background=None (or every g_s <= u_BTR) recovers the plain
     two-component. Sectors are independent (summed). Returns (Sa_abs, diagnostics).
 
     DOMAIN-INVARIANCE (country_fraction): the NATIONAL rank-1 term encodes a WHOLE-COUNTRY-total
@@ -498,8 +552,8 @@ def build_two_component_covariance(
 ):
     """Exact three-component prior error covariance (returns correlation C, per-element sigma,
     diagnostics).  Thin wrapper: assemble the absolute covariance (two_component_absolute, which adds
-    the GLOBAL Saunois systematic as a domain-wide rank-1 per sector, peeled from u_BTR so national
-    aggregates stay exactly at u_BTR), then decompose it exactly into (C, sigma)
+    the Saunois global value as a within-country FLOOR raising each national aggregate to max(u_BTR, g_s)
+    -- it only adds where u_BTR < g_s), then decompose it exactly into (C, sigma)
     (decompose_relative_covariance).  Fits the standard (correlation, sigma_scale) output contract with
     no approximation. global_background=None recovers the plain two-component."""
     n = len(totals_by_element)
@@ -552,7 +606,8 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
     uncertainty_path = config.get("NationalPriorUncertaintyFile")
     country_mask_path = config.get("NationalPriorCountryMaskFile")
     country_mask_var = config.get("NationalPriorCountryMaskVariable", "country_id")
-    country_shapefile = config.get("NationalPriorCountryShapefile")
+    # Fall back to the bundled global shapefile so any IMI user gets per-country masks with no setup.
+    country_shapefile = config.get("NationalPriorCountryShapefile") or default_country_shapefile()
     if uncertainty_path and not (country_mask_path or country_shapefile):
         raise ValueError(
             "NationalPriorUncertaintyFile was set but no country mask was provided. "
@@ -610,16 +665,15 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
         min_uncertainty = float(config.get("NationalPriorMinUncertainty", 0.30))
         global_background = None
         if str(config.get("NationalPriorGlobalBackground", True)).strip().lower() in ("true", "1", "yes"):   # default ON
-            # Saunois GLOBAL BACKGROUND: a domain-wide rank-1 per sector (magnitude g_s), PEELED from
-            # u_BTR in quadrature so every national aggregate stays EXACTLY at u_BTR while the
-            # continental/global aggregate keeps a Saunois floor (within a country: global + national +
-            # local; across countries: global only). Defaults to SAUNOIS_GLOBAL_BACKGROUND; override per
-            # sector with NationalPriorGlobalBackgroundValues: {sector: relative_uncertainty}.
+            # Saunois GLOBAL BACKGROUND applied as a FLOOR: a within-country rank-1 (magnitude g_s) added
+            # ONLY where u_BTR < g_s, raising that national aggregate to max(u_BTR, g_s) without touching
+            # the national/local grid structure (where u_BTR >= g_s nothing is added -- no double-count).
+            # Defaults to SAUNOIS_GLOBAL_BACKGROUND; override per sector with NationalPriorGlobalBackgroundValues.
             global_background = dict(SAUNOIS_GLOBAL_BACKGROUND)   # genuine Saunois global values
             global_background.update(config.get("NationalPriorGlobalBackgroundValues", {}) or {})
             print(f"Global background (Saunois) ON: {len(global_background)} sectors "
                   f"(e.g. Wetlands={global_background.get('Wetlands')}, Coal={global_background.get('Coal')}); "
-                  f"peeled from u_BTR so national aggregates stay at u_BTR, continental floored to Saunois.")
+                  f"floor -> national aggregates rise to max(u_BTR, g_s) only where u_BTR < g_s.")
         covariance, sigma_vector, diagnostics = build_two_component_covariance(
             rows, neff_sum, neff_sumsq, uncertainty_rows, totals_by_element,
             prior_sigma, grid_national_ratio, min_uncertainty, global_background,

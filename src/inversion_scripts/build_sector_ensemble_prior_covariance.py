@@ -57,6 +57,7 @@ try:
         state_vector_ids_and_mask,
         emission_weighted_element_table,
         two_component_absolute,
+        default_country_shapefile,
         write_diagnostics,
     )
 except ModuleNotFoundError:
@@ -76,6 +77,7 @@ except ModuleNotFoundError:
         state_vector_ids_and_mask,
         emission_weighted_element_table,
         two_component_absolute,
+        default_country_shapefile,
         write_diagnostics,
     )
 
@@ -196,7 +198,8 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
     uncertainty_path = config.get("NationalPriorUncertaintyFile")
     country_mask_path = config.get("NationalPriorCountryMaskFile")
     country_mask_var = config.get("NationalPriorCountryMaskVariable", "country_id")
-    country_shapefile = config.get("NationalPriorCountryShapefile")
+    # Fall back to the bundled global shapefile so any IMI user gets per-country masks with no setup.
+    country_shapefile = config.get("NationalPriorCountryShapefile") or default_country_shapefile()
     if uncertainty_path and not (country_mask_path or country_shapefile):
         raise ValueError(
             "NationalPriorUncertaintyFile was set but no country mask was provided. "
@@ -245,8 +248,8 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
     if str(config.get("NationalPriorGlobalBackground", True)).strip().lower() in ("true", "1", "yes"):   # default ON
         global_background = dict(SAUNOIS_GLOBAL_BACKGROUND)                       # genuine Saunois global values
         global_background.update(config.get("NationalPriorGlobalBackgroundValues", {}) or {})
-        print("Global background (Saunois) ON for anthro: GLOBAL systematic peeled from u_BTR (national "
-              "aggregates unchanged) and added domain-wide, so continental/global aggregates keep a Saunois floor.")
+        print("Global background (Saunois) ON for anthro: applied as a FLOOR -- adds only where u_BTR < g_s, "
+              "raising each national aggregate to max(u_BTR, g_s); national/local grid structure unchanged.")
     Sa_abs, tc_diag = two_component_absolute(
         rows, neff_sum, neff_sumsq, anthro_rows, n, grid_national_ratio, min_uncertainty, global_background,
         country_fraction=country_fraction,
