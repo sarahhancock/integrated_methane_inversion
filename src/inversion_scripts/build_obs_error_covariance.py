@@ -18,11 +18,12 @@ Two products are generated:
      fraction A of the residual variance is spatially correlated; the rest is
      independent and stays on the diagonal.
 
-Outputs written to  <run_root>/inversion_data/so_residual_error_method/:
-  sk_residual_error_{start}_{end}.npz              -- local variance + fit params + anomalies
-  so_residual_error_correlation_{start}_{end}.npz  -- spatial correlation fit parameters
-  so_diagonal_diagnostics.png                      -- 3-panel So diagonal figure
-  so_correlation_diagnostics.png                   -- 3-panel correlation figure
+Outputs written to  <run_root>/inversion_data/obs_error_covariance/:
+  sk_local_variance_{start}_{end}.npz  -- per-cell local variance + fit params + anomalies
+  so_correlation_{start}_{end}.npz     -- spatial-correlation fit parameters (DIAGNOSTIC ONLY;
+                                          the inversion uses the config OffDiagonalObsCov* keys)
+  so_diagonal_diagnostics.png          -- 3-panel So diagonal figure
+  so_correlation_diagnostics.png       -- 3-panel correlation figure
 
 By default this also overwrites <run_root>/inversion_data/so/so_{start}_{end}.npz
 with the residual-error diagonal So (key so_{obs_error_name}).  Use
@@ -69,8 +70,19 @@ def parse_args():
     p.add_argument("--r-retrieval", type=float, default=0.23)
     p.add_argument("--sigma-retrieval", type=float, default=13.30)
     p.add_argument("--sigma-transport", type=float, default=4.13)
-    p.add_argument("--floor-variance", type=float, default=50.0,
-                   help="Minimum So variance in ppb^2 (default 50)")
+    p.add_argument("--min-ind-obs", type=int, default=30,
+                   help="Minimum INDIVIDUAL observations per Sk cell (default 30). "
+                        "Cells with fewer fall back to the temporal super-ob estimate.")
+    p.add_argument("--sk-agg", type=int, default=4,
+                   help="Aggregate sk_agg x sk_agg native GC GRID CELLS for the Sk pool "
+                        "(integer aggregation of the state-vector grid, so Sk stays aligned "
+                        "with the inversion grid -- NOT a fixed-degree box). Default 4 "
+                        "(~1 deg at 0.25 deg native); raise it if cells miss --min-ind-obs.")
+    p.add_argument("--floor-variance", type=float, default=None,
+                   help="Minimum So variance in ppb^2. Default (None): the physical "
+                        "asymptote sigma_transport^2 + r*sigma_retrieval^2 from the "
+                        "count-variance fit (the P->inf irreducible error). Pass a "
+                        "number to override.")
     # Correlation estimation parameters
     p.add_argument("--max-pairs-per-month", type=int, default=250_000)
     p.add_argument("--max-distance-km", type=float, default=1_500.0)
@@ -79,7 +91,7 @@ def parse_args():
                    help="Minimum pairs per bin to include in correlation fit")
     p.add_argument("--random-seed", type=int, default=42)
     p.add_argument("--no-overwrite-merged-so", action="store_true",
-                   help="Write residual So products only under so_residual_error_method; "
+                   help="Write So products only under obs_error_covariance/; "
                         "do not update inversion_data/so/so_*.npz")
     return p.parse_args()
 
@@ -151,12 +163,13 @@ def load_observations(files, start, end):
 # ---------------------------------------------------------------------------
 
 def load_individual_obs_from_visualization(viz_dir):
-    """Load individual (unaveraged) TROPOMI pixels from IMI data_visualization pkl files.
+    """Load individual (unaveraged) satellite pixels from IMI data_visualization pkl files.
 
-    jacobian.py saves per-orbit pkl files to data_visualization/ using the
-    unaveraged apply_tropomi_operator.  Each file's obs_GC array has 6 columns:
-      [0] actual TROPOMI XCH4 (ppb)
-      [1] GC virtual XCH4 using TROPOMI averaging kernel (ppb)
+    jacobian.py saves per-orbit pkl files to data_visualization/ from the unaveraged satellite
+    operator, named \`{date}_GCtoSatellite.pkl\` (the generalized obs-operator name; older runs used
+    \`{date}_GCtoTROPOMI.pkl\`).  Each file's obs_GC array has 6 columns:
+      [0] actual satellite XCH4 (ppb)
+      [1] GC virtual XCH4 using the satellite averaging kernel (ppb)
       [2] longitude
       [3] latitude
       [4] iSat (pixel index, not used here)
@@ -174,7 +187,11 @@ def load_individual_obs_from_visualization(viz_dir):
     if not os.path.isdir(viz_dir):
         return None
 
-    pkl_files = sorted(glob.glob(os.path.join(viz_dir, "*_GCtoTROPOMI.pkl")))
+    # jacobian.py writes the individual-pixel viz files as *_GCtoSatellite.pkl (generalized obs
+    # operator); fall back to the legacy *_GCtoTROPOMI.pkl name for older run directories.
+    pkl_files = sorted(glob.glob(os.path.join(viz_dir, "*_GCtoSatellite.pkl")))
+    if not pkl_files:
+        pkl_files = sorted(glob.glob(os.path.join(viz_dir, "*_GCtoTROPOMI.pkl")))
     if not pkl_files:
         return None
 
@@ -217,58 +234,56 @@ def load_individual_obs_from_visualization(viz_dir):
     )
 
 
+def _agg_cell_id(lat, lon, gclat, gclon, agg):
+    """Map lat/lon to an aggregated-cell id: nearest native GC cell, then floor-divided
+    into blocks of ``agg`` x ``agg`` GC cells. Returns (cid, nlon_agg)."""
+    li = np.clip(np.searchsorted(gclat, lat), 1, len(gclat) - 1)
+    li -= (np.abs(lat - gclat[li - 1]) <= np.abs(lat - gclat[li]))
+    lni = np.clip(np.searchsorted(gclon, lon), 1, len(gclon) - 1)
+    lni -= (np.abs(lon - gclon[lni - 1]) <= np.abs(lon - gclon[lni]))
+    nlon_agg = int(np.ceil(len(gclon) / agg))
+    return (li // agg) * nlon_agg + (lni // agg), nlon_agg
+
+
 def compute_sk_from_pixels(tropomi_ind, gc_ch4_ind, lat_ind, lon_ind,
-                            state_vector_path, global_var):
-    """Compute within-cell sk from individual TROPOMI pixel residuals.
+                            state_vector_path, sk_agg, min_ind_obs):
+    """Individual-obs REM Sk: variance of individual (obs - GC virtual) residuals,
+    pooled over blocks of ``sk_agg`` x ``sk_agg`` native GC GRID CELLS.
 
-    For each GC grid cell, accumulates all individual pixels across all available
-    orbit files, then computes the variance of demeaned (TROPOMI - GC_virtual)
-    residuals.  Cells with fewer than 3 pixels are excluded.
+    This aggregates an INTEGER number of state-vector grid cells (not a fixed-degree
+    box), so the Sk grid stays aligned with the inversion grid at any native
+    resolution. Sk = the P=1 (individual-observation) error variance; build_diagonal_so's
+    count factor g(P) later reduces it to each super-observation's level. The
+    aggregated-cell mean is removed before the variance (strips the persistent flux/BC
+    signal). GC virtual XCH4 already has the TROPOMI averaging kernel applied.
 
-    The GC_virtual column from the visualization pkl already applies the TROPOMI
-    averaging kernel to the GC simulation, so no separate prior approximation
-    is needed.
-
-    Returns (sk_lookup, gclat, gclon) where sk_lookup is a dict {cell_id: variance}.
+    Returns (sk_lookup, grid) with sk_lookup: {agg_cell_id: variance ppb^2} and
+    grid = (gclat, gclon, agg, nlon_agg) so observations map onto the same blocks.
     """
-    from collections import defaultdict
-
     state = xr.load_dataset(state_vector_path)
-    gclat = state["lat"].values
-    gclon = state["lon"].values
-    elat = abs(float(gclat[1] - gclat[0])) / 2.0
-    elon = abs(float(gclon[1] - gclon[0])) / 2.0
+    gclat = np.asarray(state["lat"].values, float)
+    gclon = np.asarray(state["lon"].values, float)
+    agg = max(1, int(sk_agg))
 
-    li = np.searchsorted(gclat, lat_ind)
-    li = np.clip(li, 1, len(gclat) - 1)
-    li -= np.abs(lat_ind - gclat[li - 1]) <= np.abs(lat_ind - gclat[li])
-    lni = np.searchsorted(gclon, lon_ind)
-    lni = np.clip(lni, 1, len(gclon) - 1)
-    lni -= np.abs(lon_ind - gclon[lni - 1]) <= np.abs(lon_ind - gclon[lni])
+    resid = np.asarray(tropomi_ind, float) - np.asarray(gc_ch4_ind, float)
+    good = np.isfinite(resid) & np.isfinite(lat_ind) & np.isfinite(lon_ind)
+    resid = resid[good]
+    cid, nlon_agg = _agg_cell_id(np.asarray(lat_ind, float)[good],
+                                 np.asarray(lon_ind, float)[good], gclat, gclon, agg)
 
-    in_b = (
-        (np.abs(lat_ind - gclat[li]) <= elat * 1.01)
-        & (np.abs(lon_ind - gclon[lni]) <= elon * 1.01)
-    )
-    cell_id_pix = li[in_b].astype(np.int64) * len(gclon) + lni[in_b].astype(np.int64)
-    resid_pix = (tropomi_ind - gc_ch4_ind)[in_b]
+    ncell = int(np.ceil(len(gclat) / agg)) * nlon_agg
+    n = np.bincount(cid, minlength=ncell).astype(float)
+    s1 = np.bincount(cid, weights=resid, minlength=ncell)
+    s2 = np.bincount(cid, weights=resid * resid, minlength=ncell)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = s1 / n
+        var = s2 / n - mean * mean                 # population var(resid) = var(resid - agg-cell mean)
+    keep = np.nonzero((n >= min_ind_obs) & np.isfinite(var) & (var > 0))[0]
+    sk_lookup = {int(c): float(var[c]) for c in keep}
 
-    cell_resid = defaultdict(list)
-    for cid, r in zip(cell_id_pix, resid_pix):
-        if np.isfinite(r):
-            cell_resid[cid].append(r)
-
-    sk_lookup = {}
-    for cid, resids in cell_resid.items():
-        if len(resids) < 3:
-            continue
-        r = np.asarray(resids)
-        sk_lookup[cid] = float(np.var(r - r.mean()))
-
-    n_pix = int(in_b.sum())
-    print(f"  sk (individual pixels): {n_pix:,} valid pixels → "
-          f"{len(sk_lookup)} grid cells with variance estimates")
-    return sk_lookup, gclat, gclon
+    print(f"  sk (individual obs): {resid.size:,} pixels -> {len(sk_lookup)} cells "
+          f"({agg}x{agg} GC-cell blocks, >= {min_ind_obs} obs/cell)")
+    return sk_lookup, (gclat, gclon, agg, nlon_agg)
 
 
 # ---------------------------------------------------------------------------
@@ -365,11 +380,24 @@ def fit_count_variance(counts, anomalies, fallback):
         return fallback
 
 
-def build_diagonal_so(sk_est, counts, r_retrieval, sigma_retrieval, sigma_transport, floor_variance):
-    """Combine local spatial variance with count scaling to form diagonal So."""
+def build_diagonal_so(sk_est, counts, r_retrieval, sigma_retrieval, sigma_transport, floor_variance,
+                      individual_mask=None):
+    """Scale the individual-obs variance Sk to each super-observation's count level.
+
+    Sk is the P=1 (individual-observation) error variance. The Chen et al. 2023 count
+    factor g(P) = sigma^2(P) / sigma^2(1) reduces it for a super-ob that averaged
+    `counts` retrievals; the physical floor sigma^2(inf) is then imposed.
+
+    individual_mask: boolean array marking elements whose sk_est IS the P=1 individual amplitude,
+    where g(P) is applied. Where it is False, sk_est is the temporal SUPER-OBSERVATION variance
+    (already at the count-P level), so g(P) is NOT applied there -- applying it would reduce an
+    already-reduced variance and bias So low. None -> all True (legacy: treat every cell as P=1).
+    """
     gp = residual_count_variance(counts, r_retrieval, sigma_retrieval, sigma_transport)
-    gp = gp / np.nanmax(gp)
-    so = sk_est * gp
+    gp = gp / residual_count_variance(1.0, r_retrieval, sigma_retrieval, sigma_transport)  # g(P)/g(1)
+    if individual_mask is not None:
+        gp = np.where(np.asarray(individual_mask, dtype=bool), gp, 1.0)   # no g(P) on super-ob fallback cells
+    so = sk_est * gp                                          # sigma^2(P) with the per-cell amplitude
     so[~np.isfinite(so)] = float(np.nanmean(so[np.isfinite(so)]))
     so = np.maximum(so, floor_variance).astype(np.float32)
     return so
@@ -646,7 +674,8 @@ def plot_correlation_diagnostics(
             A, L = fit_results["gaussian"]["amplitude"], fit_results["gaussian"]["length_km"]
             ax.plot(d_fit, A * np.exp(-(d_fit / L)**2), color="tab:orange", lw=2, ls="--",
                     label=f"A exp(−(d/L)²),  A = {A:.2f},  L = {L:.0f} km")
-    ylim_top = max(0.18, float(np.nanmax(corr_by_distance[np.isfinite(corr_by_distance)])) * 1.25)
+    finite_corr = corr_by_distance[np.isfinite(corr_by_distance)]
+    ylim_top = max(0.18, float(np.nanmax(finite_corr)) * 1.25) if finite_corr.size else 0.18
     ax.set_ylim(-0.05, ylim_top)
     ax.set_ylabel("Residual-error correlation")
     ax.set_title("(b) Amplitude fit  [ρ(0) = A < 1]")
@@ -690,7 +719,7 @@ def main():
     start, end = args.start, args.end
     rng_seed = args.random_seed
 
-    print(f"\n=== build_residual_obs_covariance.py  {start} -> {end} ===")
+    print(f"\n=== build_obs_error_covariance.py  {start} -> {end} ===")
 
     # ------------------------------------------------------------------
     # Load merged monthly observations
@@ -701,61 +730,61 @@ def main():
     print(f"Total superobservations: {y.size:,}")
 
     # ------------------------------------------------------------------
-    # Diagonal So: local spatial variance + count scaling
+    # Diagonal So: individual-obs Sk (P=1 amplitude) scaled by g(P), floored
     # ------------------------------------------------------------------
-    # Step 1: temporal superobservation variance (always computed — used for
-    # anomalies → count-variance fit, and as fallback where pixels are sparse).
-    print("Estimating local spatial residual variance ...")
-    sk_est, anomalies, global_var = estimate_local_variance(
+    # Temporal super-ob variance: its anomalies drive the g(P) count-variance fit,
+    # and it is the FALLBACK Sk where a cell lacks >= --min-ind-obs individual obs.
+    print("Estimating temporal super-ob residual variance (for g(P) fit + fallback) ...")
+    sk_temporal, anomalies, global_var = estimate_local_variance(
         y, prior, lat, lon, args.state_vector
     )
     print(f"  Global residual std: {np.sqrt(global_var):.2f} ppb")
 
-    # Step 2: override sk with individual-pixel within-cell variance when the
-    # IMI visualization pkl files are present in {run_root}/inversion/data_visualization/.
-    # Those pkl files are written by jacobian.py using apply_tropomi_operator
-    # (unaveraged) and have the GC virtual XCH4 already computed with the
-    # TROPOMI averaging kernel — no prior approximation needed.
-    viz_dir = os.path.join(run_root, "inversion", "data_visualization")
-    ind_result = load_individual_obs_from_visualization(viz_dir)
-    if ind_result is not None:
-        tropomi_ind, gc_ch4_ind, lat_ind, lon_ind = ind_result
-        print(f"  Using {len(tropomi_ind):,} individual pixels for sk "
-              f"(from {viz_dir})")
-        sk_lookup, gclat_sv, gclon_sv = compute_sk_from_pixels(
-            tropomi_ind, gc_ch4_ind, lat_ind, lon_ind, args.state_vector, global_var
-        )
-        # Map per-cell pixel sk onto per-observation sk_est
-        state = xr.load_dataset(args.state_vector)
-        elat = abs(float(state["lat"].values[1] - state["lat"].values[0])) / 2.0
-        elon = abs(float(state["lon"].values[1] - state["lon"].values[0])) / 2.0
-        lat_idx_sv = np.searchsorted(gclat_sv, lat)
-        lat_idx_sv = np.clip(lat_idx_sv, 1, len(gclat_sv) - 1)
-        lat_idx_sv -= np.abs(lat - gclat_sv[lat_idx_sv - 1]) <= np.abs(lat - gclat_sv[lat_idx_sv])
-        lon_idx_sv = np.searchsorted(gclon_sv, lon)
-        lon_idx_sv = np.clip(lon_idx_sv, 1, len(gclon_sv) - 1)
-        lon_idx_sv -= np.abs(lon - gclon_sv[lon_idx_sv - 1]) <= np.abs(lon - gclon_sv[lon_idx_sv])
-        cell_id_sv = lat_idx_sv.astype(np.int64) * len(gclon_sv) + lon_idx_sv.astype(np.int64)
-        n_overridden = 0
-        for i, cid in enumerate(cell_id_sv):
-            if cid in sk_lookup:
-                sk_est[i] = sk_lookup[cid]
-                n_overridden += 1
-        frac = n_overridden / max(1, len(sk_est))
-        print(f"  sk overridden for {n_overridden}/{len(sk_est)} obs ({frac:.1%}) "
-              f"using individual pixels; remainder uses temporal fallback")
-    else:
-        print(f"  No visualization pkl files found in {viz_dir}; "
-              f"using temporal superobservation variance for sk")
-
+    # Fit the Chen et al. 2023 count-variance model g(P) from super-ob anomalies vs count.
     fallback = (args.r_retrieval, args.sigma_retrieval, args.sigma_transport)
-    print("Fitting count-variance model ...")
+    print("Fitting count-variance model g(P) ...")
     r_ret, sig_ret, sig_tra = fit_count_variance(counts, anomalies, fallback)
     print(f"  r_retrieval={r_ret:.4f}, sigma_retrieval={sig_ret:.4f}, sigma_transport={sig_tra:.4f}")
 
-    so = build_diagonal_so(sk_est, counts, r_ret, sig_ret, sig_tra, args.floor_variance)
-    print(f"  So range: {np.nanmin(so):.1f} – {np.nanmax(so):.1f} ppb²  "
-          f"(mean sqrt = {np.sqrt(so).mean():.2f} ppb,  floor fraction = {np.mean(so == args.floor_variance):.2f})")
+    # PRIMARY Sk: individual-obs within-cell variance (the P=1 amplitude), pooled over
+    # --sk-agg x --sk-agg GC-cell blocks with >= --min-ind-obs pixels/block. Requires the
+    # IMI visualization pkl files (unaveraged apply_tropomi_operator output; GC virtual
+    # already has the TROPOMI averaging kernel applied) in {run_root}/inversion/data_visualization/.
+    viz_dir = os.path.join(run_root, "inversion", "data_visualization")
+    ind_result = load_individual_obs_from_visualization(viz_dir)
+    sk_est = sk_temporal.copy()
+    have = np.zeros(sk_est.shape, dtype=bool)   # per-element: is sk_est the P=1 individual amplitude?
+    if ind_result is not None:
+        tropomi_ind, gc_ch4_ind, lat_ind, lon_ind = ind_result
+        print(f"  Using {len(tropomi_ind):,} individual pixels for Sk (from {viz_dir})")
+        sk_lookup, (gclat_agg, gclon_agg, agg, nlon_agg) = compute_sk_from_pixels(
+            tropomi_ind, gc_ch4_ind, lat_ind, lon_ind,
+            args.state_vector, args.sk_agg, args.min_ind_obs,
+        )
+        cid, _ = _agg_cell_id(lat, lon, gclat_agg, gclon_agg, agg)
+        sk_ind = np.array([sk_lookup.get(int(c), np.nan) for c in cid])
+        have = np.isfinite(sk_ind)
+        sk_est[have] = sk_ind[have]          # individual Sk where the block has >= min_ind_obs
+        print(f"  Sk from individual obs for {int(have.sum()):,}/{sk_est.size:,} obs "
+              f"({have.mean() * 100:.1f}%); remainder uses temporal fallback")
+    else:
+        print(f"  WARNING: no individual-pixel pkls in {viz_dir}; Sk falls back to the temporal "
+              f"super-ob variance for ALL cells (g(P) is NOT applied to these, so So is not biased "
+              f"low, but this is the DEGRADED REM -- regenerate data_visualization for a correct Sk).")
+
+    # Floor = physical asymptote sigma^2(inf) = sigma_t^2 + r*sigma_r^2 unless overridden.
+    if args.floor_variance is None:
+        floor_variance = sig_tra ** 2 + r_ret * sig_ret ** 2
+        print(f"  Floor = physical sigma^2(inf) = {floor_variance:.1f} ppb^2 "
+              f"({np.sqrt(floor_variance):.2f} ppb)")
+    else:
+        floor_variance = float(args.floor_variance)
+        print(f"  Floor = {floor_variance:.1f} ppb^2 (override)")
+
+    so = build_diagonal_so(sk_est, counts, r_ret, sig_ret, sig_tra, floor_variance, individual_mask=have)
+    print(f"  So range: {np.nanmin(so):.1f} - {np.nanmax(so):.1f} ppb^2  "
+          f"(mean sqrt = {np.sqrt(so).mean():.2f} ppb,  floor fraction = "
+          f"{np.mean(so <= floor_variance * (1.0 + 1e-4)):.2f})")
 
     # ------------------------------------------------------------------
     # Spatial correlation of residual anomalies
@@ -771,21 +800,27 @@ def main():
     fit_results = fit_correlation_model(dist_centers, corr_vals, pair_counts, args.min_pair_count)
     if fit_results:
         for name, params in fit_results.items():
-            print(f"  {name}: A={params['amplitude']:.3f}, L={params['length_km']:.1f} km")
+            if "amplitude" in params:                          # single-component fits (exponential/gaussian/…)
+                print(f"  {name}: A={params['amplitude']:.3f}, L={params['length_km']:.1f} km")
+            elif "amplitude1" in params:                       # two_exponential entry has A1/L1/A2/L2
+                print(f"  {name}: A1={params['amplitude1']:.3f}, L1={params['length1_km']:.1f} km, "
+                      f"A2={params['amplitude2']:.3f}, L2={params['length2_km']:.1f} km")
+            else:
+                print(f"  {name}: {params}")
     else:
         print("  Warning: correlation fitting failed; off-diagonal So will not be saved")
 
     # ------------------------------------------------------------------
     # Save outputs
     # ------------------------------------------------------------------
-    residual_dir = Path(run_root) / "inversion_data" / "so_residual_error_method"
+    residual_dir = Path(run_root) / "inversion_data" / "obs_error_covariance"
     so_dir = Path(run_root) / "inversion_data" / "so"
     residual_dir.mkdir(parents=True, exist_ok=True)
     so_dir.mkdir(parents=True, exist_ok=True)
 
     # Fit diagnostics + anomalies
     np.savez(
-        residual_dir / f"sk_residual_error_{start}_{end}.npz",
+        residual_dir / f"sk_local_variance_{start}_{end}.npz",
         sk_by_observation=sk_est.astype(np.float32),
         residual_anomaly=anomalies.astype(np.float32),
         r_retrieval=np.float32(r_ret),
@@ -826,7 +861,7 @@ def main():
         empirical_correlation=corr_vals.astype(np.float32),
         pair_count=pair_counts.astype(np.int64),
     )
-    corr_path = residual_dir / f"so_residual_error_correlation_{start}_{end}.npz"
+    corr_path = residual_dir / f"so_correlation_{start}_{end}.npz"
 
     if two_exp is not None:
         np.savez(
@@ -878,7 +913,11 @@ def main():
             if so_npz_path.exists():
                 with np.load(so_npz_path) as f:
                     existing = {k: f[k] for k in f.files}
-            existing[f"so_{args.obs_error_name}"] = so_month
+            try:
+                obs_key = str(float(args.obs_error_name))     # normalise "15" -> "15.0" to match invert.py's ensure_float_list key
+            except (TypeError, ValueError):
+                obs_key = str(args.obs_error_name)
+            existing[f"so_{obs_key}"] = so_month
             np.savez(so_npz_path, **existing)
         print(f"  {month_start} -> {month_end}: n={so_month.size:,}, "
               f"mean sqrt(So)={np.sqrt(so_month).mean():.2f} ppb"

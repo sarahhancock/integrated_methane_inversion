@@ -180,7 +180,7 @@ def get_country_fraction_mask(country, lat, lon, shapes, name_column, area_weigh
         mask = np.array(regionmask.mask_geopandas(country_shape, lon, lat) + 1)
         mask[np.isnan(mask)] = 0
         mask[mask > 0] = 1
-        return mask.astype(float)
+        return mask.astype(float), 1.0            # binary: in-domain fraction unknown -> f_C=1 (no scaling)
 
     dlat = float(np.abs(lat[1] - lat[0]))
     dlon = float(np.abs(lon[1] - lon[0]))
@@ -194,13 +194,18 @@ def get_country_fraction_mask(country, lat, lon, shapes, name_column, area_weigh
     grid = gpd.GeoDataFrame(geometry=grid_cells, crs="EPSG:4326").to_crs(shapes.crs)
     country_projected = country_shape.to_crs(shapes.crs)
     mask = np.zeros((len(lat), len(lon)), dtype=float)
+    indomain_area = 0.0
     for geom, (i, j) in zip(grid.geometry, indices):
         if geom.is_empty or geom.area == 0:
             continue
         intersection = country_projected.intersection(geom)
         if not intersection.is_empty.all():
-            mask[i, j] = float(intersection.area.sum() / geom.area)
-    return mask
+            ia = float(intersection.area.sum())
+            mask[i, j] = ia / geom.area
+            indomain_area += ia                   # accumulate the in-domain country area (projected)
+    full_area = float(country_projected.area.sum())
+    f_c = (indomain_area / full_area) if full_area > 0 else 1.0   # in-domain fraction of the whole country
+    return mask, min(max(f_c, 0.0), 1.0)
 
 
 def build_country_mask_from_shapes(uncertainty_rows, prior, config):
@@ -208,7 +213,7 @@ def build_country_mask_from_shapes(uncertainty_rows, prior, config):
     name_column = config.get("NationalPriorCountryNameColumn", "NAME")
     area_weighting = bool(config.get("NationalPriorCountryMaskAreaWeighting", True))
     if not shapefile:
-        return None
+        return None, None
 
     shapes = load_country_shapes(shapefile, name_column)
     mask = xr.DataArray(
@@ -217,6 +222,8 @@ def build_country_mask_from_shapes(uncertainty_rows, prior, config):
         dims=("lat", "lon"),
     )
     country_lookup = {}
+    country_fraction = {}                                      # {country_id(str): in-domain area fraction}
+    best_fraction = np.zeros((prior.sizes["lat"], prior.sizes["lon"]), dtype=float)  # best per-cell coverage so far
     next_id = 1
     for row in uncertainty_rows:
         country_name = row.get("country_name") or row["country_id"]
@@ -225,7 +232,7 @@ def build_country_mask_from_shapes(uncertainty_rows, prior, config):
             continue
         country_id = int(row["country_id"]) if str(row["country_id"]).isdigit() else next_id
         next_id = max(next_id, country_id + 1)
-        fraction = get_country_fraction_mask(
+        fraction, f_c = get_country_fraction_mask(
             country_name,
             prior.lat.values,
             prior.lon.values,
@@ -234,12 +241,14 @@ def build_country_mask_from_shapes(uncertainty_rows, prior, config):
             area_weighting=area_weighting,
         )
         current = mask.values
-        replace = fraction > current
+        replace = fraction > best_fraction                    # assign each cell to the country covering the MOST of it
         current[replace] = country_id
+        best_fraction[replace] = fraction[replace]
         mask.values[:] = current
         country_lookup[country_name] = country_id
+        country_fraction[str(country_id)] = f_c               # str key: two_component_absolute looks up by str id
         row["country_id"] = str(country_id)
-    return mask
+    return mask, country_fraction
 
 
 def select_state_vector_subset(state_vector, prior):
@@ -375,6 +384,7 @@ def build_weighted_correlation(rows, totals_by_element, group_rho):
 def two_component_absolute(
     rows, neff_sum, neff_sumsq, uncertainty_rows, n_elements,
     grid_national_ratio=2.5, min_uncertainty=0.30, global_background=None,
+    country_fraction=None,
 ):
     """Prior error covariance in ABSOLUTE emission^2 units, as a sum of three nested, independent
     error components (a variance-components / random-effects model). For two cells i, j of one sector:
@@ -396,10 +406,18 @@ def two_component_absolute(
     which genuine Saunois values always satisfy against the 30% BTR floor; if a sector ever has g_s >
     u_BTR the residual clips to 0 (that country's error becomes fully global and its aggregate rises to
     g_s > u_BTR, flagged in the diagnostics). global_background=None (or g_s=0) recovers the plain
-    two-component. Sectors are independent (summed). Returns (Sa_abs, diagnostics)."""
+    two-component. Sectors are independent (summed). Returns (Sa_abs, diagnostics).
+
+    DOMAIN-INVARIANCE (country_fraction): the NATIONAL rank-1 term encodes a WHOLE-COUNTRY-total
+    constraint (snat set so the in-domain aggregate == u_BTR), valid only if the country is fully in
+    the domain. For a country with only fraction f_C of its emissions in-domain (the rest held at
+    prior), a coherent in-domain shift moves the national total by f_C, so to keep the implied national
+    uncertainty == u_BTR the in-domain national variance is scaled by 1/f_C^2. country_fraction =
+    {country_id: f_C in (0,1]}; None or a missing key -> f_C=1 (unchanged, the current behaviour). The
+    LOCAL diagonal term is a per-cell allocation error and is NOT scaled. f_C -> 0 makes the national
+    term vanish (a sliver cannot be pinned to a national total)."""
     bg = global_background or {}
     Sa_abs = np.zeros((n_elements, n_elements), dtype=np.float64)
-    sector_emis = defaultdict(lambda: np.zeros(n_elements, dtype=np.float64))   # per-sector emission, for the GLOBAL rank-1
 
     emissions_by_group = defaultdict(lambda: defaultdict(float))
     for (country_id, sector, pos), value in rows.items():
@@ -420,8 +438,7 @@ def two_component_absolute(
         total = float(emis.sum())
         if total <= 0:
             continue
-        g = float(bg.get(sector, 0.0))                         # GLOBAL (Saunois) systematic for this sector
-        u_res = np.sqrt(max(u * u - g * g, 0.0))               # peel g from u_BTR in quadrature (0 if g > u)
+        g = float(bg.get(sector, 0.0))                         # Saunois global background FLOOR for this sector
         n_eff = np.array([
             (neff_sum[(sector, int(p))] ** 2 / neff_sumsq[(sector, int(p))])
             if neff_sumsq.get((sector, int(p)), 0.0) > 0 else 1.0
@@ -430,28 +447,30 @@ def two_component_absolute(
         n_eff = np.clip(n_eff, 1.0, None)
         r2 = (grid_national_ratio ** 2 - 1.0) / n_eff          # ratio_i^2 - 1 (local excess)
         Q = float(np.sum(r2 * emis ** 2)) / (total * total)
-        snat = u_res / np.sqrt(1.0 + Q)                        # NATIONAL amplitude from the RESIDUAL uncertainty
-        Sa_abs[np.ix_(positions, positions)] += (snat * snat) * np.outer(emis, emis)  # NATIONAL rank-1 (within country)
-        Sa_abs[positions, positions] += (snat * snat) * r2 * emis ** 2                # LOCAL diagonal
-        sector_emis[sector][positions] += emis                # accumulate for the GLOBAL rank-1 (added below)
-        # national aggregate = GLOBAL g^2 E_c^2 + NATIONAL snat^2 E_c^2 + LOCAL = (g^2 + u_res^2) E_c^2 = u_BTR^2 E_c^2
+        snat = u / np.sqrt(1.0 + Q)                            # NATIONAL amplitude from the FULL u_BTR (no peel)
+        fC = float(country_fraction.get(country_id, 1.0)) if country_fraction else 1.0  # in-domain emission fraction
+        fC = min(max(fC, 1.0e-3), 1.0)                         # clip (1e-3 -> national term ~vanishes for a sliver)
+        Sa_abs[np.ix_(positions, positions)] += (snat * snat / (fC * fC)) * np.outer(emis, emis)  # NATIONAL rank-1 /f_C^2 (domain-invariant)
+        Sa_abs[positions, positions] += (snat * snat) * r2 * emis ** 2                # LOCAL diagonal (per-cell allocation; NOT f-scaled)
+        # Saunois FLOOR (global background, applied to ALL sectors): g only ADDS where the BTR aggregate is
+        # short of g (u < g); it NEVER peels down the national/local grid structure.  Where u >= g nothing is
+        # added -- the BTR value already covers the Saunois background, so there is no double-counting.  The
+        # national aggregate therefore rises to max(u, g) and the grid-scale structure is always preserved.
+        g_floor2 = max(g * g - u * u, 0.0)                     # (g^2 - u^2) where u < g, else 0
+        if g_floor2 > 0.0:
+            Sa_abs[np.ix_(positions, positions)] += g_floor2 * np.outer(emis, emis)   # within-country systematic floor -> aggregate = g
+        # national aggregate^2 = NATIONAL snat^2 E_c^2 + LOCAL snat^2 sum(r2 E^2) + FLOOR g_floor2 E_c^2
+        #                      = (u^2 + max(g^2 - u^2, 0)) E_c^2 = max(u, g)^2 E_c^2
         achieved = np.sqrt((snat * snat) * (total * total + float(np.sum(r2 * emis ** 2)))
-                           + (g * g) * total * total) / total
+                           + g_floor2 * total * total) / total
         diagnostics.append({
             "country_id": country_id, "sector": sector, "status": "ok",
             "relative_uncertainty": u, "global_background": g,
-            "national_residual_uncertainty": float(u_res),
-            "achieved_relative_uncertainty": float(achieved),   # == u_BTR (or g_s if g_s > u_BTR)
+            "saunois_floor_added": float(np.sqrt(g_floor2)),    # extra systematic added (0 unless u < g)
+            "achieved_relative_uncertainty": float(achieved),   # == max(u_BTR, g_s)
             "n_elements": int(positions.size), "median_ratio": float(np.median(np.sqrt(1.0 + r2))),
         })
 
-    # ---- GLOBAL rank-1 per sector: g_s^2 * outer(e_s, e_s) over ALL cells => couples every country ----
-    for sector, e_s in sector_emis.items():
-        g = float(bg.get(sector, 0.0))
-        if g <= 0 or float(e_s.sum()) <= 0:
-            continue
-        pos = np.nonzero(e_s)[0]
-        Sa_abs[np.ix_(pos, pos)] += (g * g) * np.outer(e_s[pos], e_s[pos])
     return Sa_abs, diagnostics
 
 
@@ -475,6 +494,7 @@ def decompose_relative_covariance(Sa_abs, totals_by_element, prior_sigma):
 def build_two_component_covariance(
     rows, neff_sum, neff_sumsq, uncertainty_rows, totals_by_element,
     prior_sigma, grid_national_ratio=2.5, min_uncertainty=0.30, global_background=None,
+    country_fraction=None,
 ):
     """Exact three-component prior error covariance (returns correlation C, per-element sigma,
     diagnostics).  Thin wrapper: assemble the absolute covariance (two_component_absolute, which adds
@@ -486,6 +506,7 @@ def build_two_component_covariance(
     Sa_abs, diagnostics = two_component_absolute(
         rows, neff_sum, neff_sumsq, uncertainty_rows, n,
         grid_national_ratio, min_uncertainty, global_background,
+        country_fraction=country_fraction,
     )
     C, sigma_out = decompose_relative_covariance(Sa_abs, totals_by_element, prior_sigma)
     return C, sigma_out, diagnostics
@@ -556,6 +577,7 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
     state_vector_subset = select_state_vector_subset(state_vector, prior)
     roi_ids, _ = state_vector_ids_and_mask(state_vector_subset, int(nbuffer_elements))
 
+    country_fraction = None
     if using_global_defaults:
         print("NationalPriorUncertaintyFile not set; using Saunois et al. global sectoral defaults.")
         uncertainty_rows = build_saunois_default_table()
@@ -565,7 +587,16 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
         if country_mask_path:
             country_mask = load_country_mask(country_mask_path, country_mask_var)
         else:
-            country_mask = build_country_mask_from_shapes(uncertainty_rows, prior, config)
+            country_mask, country_fraction = build_country_mask_from_shapes(uncertainty_rows, prior, config)
+    # DOMAIN-INVARIANT national term (opt-in): scale each country's national rank-1 by 1/f_C^2 so a
+    # partially-in-domain country is not pinned to its whole-country total. Needs the shapefile mask
+    # (country_fraction); default OFF so existing runs are unchanged.
+    if str(config.get("NationalPriorDomainInvariant", False)).strip().lower() not in ("true", "1", "yes"):
+        country_fraction = None
+    elif country_fraction is not None:
+        print(f"Domain-invariant national term ON: f_C for {len(country_fraction)} countries "
+              f"(min {min(country_fraction.values()):.2f}, max {max(country_fraction.values()):.2f}); "
+              f"national var scaled by 1/f_C^2.")
 
     rows, totals_by_element, neff_sum, neff_sumsq = emission_weighted_element_table(
         state_vector_subset, country_mask, prior, sector_fields, roi_ids
@@ -592,6 +623,7 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
         covariance, sigma_vector, diagnostics = build_two_component_covariance(
             rows, neff_sum, neff_sumsq, uncertainty_rows, totals_by_element,
             prior_sigma, grid_national_ratio, min_uncertainty, global_background,
+            country_fraction=country_fraction,
         )
         if not diagnostics:
             raise ValueError(

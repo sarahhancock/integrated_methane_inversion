@@ -1,3 +1,13 @@
+> ⚠️ **HISTORICAL / STALE (2026-09-22).** This audit predates the productionization pass and its file
+> names, line numbers, and "Verdict" are out of date. The error methods are now config-driven and
+> production-ready: `SoftplusErrors: true` / `LognormalErrors: true` solvers, correlated Sa
+> (`OffDiagonalPriorCov` + `PriorCovarianceMethod`, Saunois backgrounds on by default), and correlated
+> So (`OffDiagonalObsCov`: SA two-exponential off-diagonal from config + per-region REM diagonal on
+> individual observations). Renames: `build_full_prior_covariance.py`→`build_length_scale_prior_covariance.py`,
+> `positivity_solvers.py`→`softplus_invert.py`, `build_residual_obs_covariance.py`→`build_obs_error_covariance.py`,
+> `so_residual_error_method/`→`obs_error_covariance/`. Current state + plan: `claude_working/PRODUCTIONIZATION_PLAN.md`.
+> Kept for history only.
+
 # IMI branch — updated-error-method integration audit
 
 **Branch:** `south_america_trends_imi_dev` (geoschem/IMI fork, `dev`).

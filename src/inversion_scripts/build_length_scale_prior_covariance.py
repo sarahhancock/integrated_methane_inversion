@@ -6,6 +6,11 @@ import numpy as np
 import xarray as xr
 from utils import get_mean_emissions
 
+try:
+    from src.utilities.config_utils import load_config
+except ImportError:
+    from config_utils import load_config
+
 """
 Build a full prior error covariance matrix with off-diagonal structure based 
 on spatial proximity and emission sector similarity. The resulting covariance 
@@ -27,8 +32,11 @@ is calculated as the product of:
    variance of each state vector element. The matrix is then scaled in the 
    inversion step based on the specified prior error standard deviation.
    
+This is the `PriorCovarianceMethod: length_scale` builder (the IMI default). The length scale is
+read from the config key `LengthScalePriorCov`.
+
 Example usage:
-python build_full_prior_covariance.py /path/to/StateVector.nc /prior/emissions/dir $length_scale_km $StartDate $EndDate $nbuffer_elements
+python build_length_scale_prior_covariance.py /path/to/StateVector.nc /prior/emissions/dir /path/to/config.yml $StartDate $EndDate $nbuffer_elements
 """
 
 
@@ -174,12 +182,18 @@ def append_buffer_diagonal_elements(
 def main(
     sv_path: str,
     prior_emis_dir: str,
-    length_scale_km: float,
+    config_path: str,
     start_date: str,
     end_date: str,
     nbuffer_elements: int,
 ) -> None:
-    """Create and save the normalized prior covariance bundle for an inversion run."""
+    """Create and save the normalized prior covariance bundle for an inversion run.
+
+    The length scale is read from the config key ``LengthScalePriorCov`` so this builder
+    takes the same CLI (sv, prior, config, start, end, nbuffer) as the national-inventory
+    and sector-ensemble builders.
+    """
+    length_scale_km = float(load_config(config_path)["LengthScalePriorCov"])
     # only have off diagonal covariance for elements in the ROI,
     # so set all buffer elements to False
     state_vector = xr.open_dataset(sv_path).isel(time=0)
@@ -211,10 +225,10 @@ def main(
 if __name__ == "__main__":
     sv_path = sys.argv[1]
     prior_emis_dir = sys.argv[2]
-    length_scale_km = float(sys.argv[3])
+    config_path = sys.argv[3]
     start_date = sys.argv[4]
     end_date = sys.argv[5]
     nbuffer_elements = int(sys.argv[6])
     main(
-        sv_path, prior_emis_dir, length_scale_km, start_date, end_date, nbuffer_elements
+        sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_elements
     )

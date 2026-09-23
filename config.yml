@@ -127,14 +127,29 @@ ShapeFile: "/home/ubuntu/integrated_methane_inversion/resources/shapefiles/Permi
 ## - PriorErrorOH is a relative fraction (e.g. 0.1 = 10%)
 ## - PriorErrorBCs is in ppb
 ## - PriorErrorBufferElements is only used if LognormalErrors is true
+##
+## ========================= INVERSION SOLVER (error model) =========================
+## Choose at most one positivity solver; default (both false) = analytical Gaussian (unconstrained).
+##   SoftplusErrors: true   -> softplus positivity solver: non-negative emissions, posterior-mean fit
+##                             (the fit responds to the MEAN; see Hancock et al. 2025 / PR #464).
+##                             Runs on the normal analytical path -- no extra simulation needed.
+##   LognormalErrors: true  -> lognormal error solver: positive by construction; PriorError is then the
+##                             geometric standard deviation (e.g. 2 = factor-of-2 uncertainty).
 LognormalErrors: false
+SoftplusErrors: false
+## SoftplusScale: 0.1       # softplus smoothing scale, only used if SoftplusErrors: true
 PriorError: [0.5]
 PriorErrorBCs: [10.0]
 PriorErrorBufferElements: [0.5]
 ObsError: [15]
 Gamma: [1.0]
 PrecomputedJacobian: false
-OffDiagonalPriorCov: false
+
+## ================= PRIOR ERROR COVARIANCE Sa (spatially correlated) =================
+## OffDiagonalPriorCov: true builds a correlated Sa via PriorCovarianceMethod (length_scale |
+## national_inventory | sector_ensemble). Saunois global-background natural correlation terms are
+## ON BY DEFAULT for the sector_ensemble / national_inventory methods (see the GLOBAL BACKGROUND note).
+OffDiagonalPriorCov: true
 LengthScalePriorCov: 25  ## in km, only used if OffDiagonalPriorCov is true
 ## Options for OffDiagonalPriorCov:
 ##   PriorCovarianceMethod: "length_scale"        # default
@@ -179,6 +194,7 @@ LengthScalePriorCov: 25  ## in km, only used if OffDiagonalPriorCov is true
 ##   # NationalPriorGlobalBackgroundValues: {Coal: 0.10, Oil: 0.15, ...}   # override the Saunois defaults
 ##   # SectorEnsembleWetlandGlobalValue: 0.28                              # Saunois global wetland 1-sigma
 
+## ============= OBSERVATIONAL ERROR COVARIANCE So (data-driven, correlated) =============
 ## Observational error covariance from the residual-error method (REM). ON BY DEFAULT: it replaces the
 ## uniform config ObsError with a PER-CELL diagonal So -- each cell's error magnitude (sk) is estimated
 ## from its own residual variance, then scaled by the Chen et al. (2023) super-observation count curve --

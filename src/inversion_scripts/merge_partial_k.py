@@ -125,11 +125,11 @@ def merge_partial_k(satdat_dir, lat_bounds, lon_bounds, obs_errs, precomp_K, all
         # read K from reference dir if precomp_K is true
         if precomp_K:
             # Get Jacobian from reference inversion
-            fi_ref = str(K_ref_file_mappings.get(Path(pth)))
+            fi_ref = K_ref_file_mappings.get(Path(pth))   # may be None (str() would hide it -> "None")
             if fi_ref is None:
                 print(f"No reference file found for {pth}. Skipping this file.")
                 continue
-            dat_ref = load_obj(fi_ref)
+            dat_ref = load_obj(str(fi_ref))
             K_temp = dat_ref["K"][ind[0]]
         else:
             K_temp = obj["K"][ind[0]] if "K" in obj else None

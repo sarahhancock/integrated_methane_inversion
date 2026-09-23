@@ -133,6 +133,41 @@ optional_rules: Dict[str, Rule] = {
     "NationalPriorCountryNameColumn": str,
     "NationalPriorCountryMaskAreaWeighting": bool,
     "NationalPriorSectorFields": ANY,
+    # --- Inversion solver selection (see config.yml "Inversion solver") ---
+    "InversionMethod": str,                       # analytical (default) | softplus (back-compat w/ SoftplusErrors)
+    "SoftplusErrors": bool,                       # documented flag: softplus positivity solver
+    "SoftplusScale": ANY,                         # softplus smoothing scale s (float)
+    # --- Correlated prior-error covariance Sa (national_inventory | sector_ensemble) ---
+    "NationalPriorGridNationalRatio": ANY,        # R01 grid:national error ratio
+    "NationalPriorMinUncertainty": ANY,           # floor on reported sector uncertainty
+    "NationalPriorTwoComponent": bool,            # three-component (global/national/local) model
+    "NationalPriorGlobalBackground": bool,        # Saunois global background correlation floor (anthro)
+    "NationalPriorGlobalBackgroundValues": ANY,   # per-sector Saunois background overrides
+    "NationalPriorSectorAmplitude": ANY,
+    "NationalPriorDomainInvariant": bool,
+    "SectorEnsembleTwoComponentSectors": ANY,     # anthro sectors using the national two-component block
+    "SectorEnsembleGenericSectors": ANY,          # sectors using the generic correlated block
+    "SectorEnsembleGenericSigma": ANY,
+    "SectorEnsembleGenericLengthKm": ANY,
+    "SectorEnsembleGenericGlobalBackground": bool,        # Saunois background floor (generic naturals)
+    "SectorEnsembleGenericGlobalBackgroundValues": ANY,
+    "SectorEnsembleWetlandFile": str,             # wetland ensemble per-cell relative error
+    "SectorEnsembleWetlandVar": str,
+    "SectorEnsembleWetlandLengthKm": ANY,
+    "SectorEnsembleWetlandSigmaScale": ANY,
+    "SectorEnsembleSigmaFloor": ANY,
+    "SectorEnsembleSigmaCap": ANY,
+    "SectorEnsembleWetlandGlobalBackground": bool,        # Saunois background floor (wetlands)
+    "SectorEnsembleWetlandGlobalValue": ANY,
+    # --- Correlated observational-error covariance So (REM diagonal + off-diagonal correlation) ---
+    "OffDiagonalObsCov": bool,                    # data-driven REM So + off-diagonal spatial correlation
+    "OffDiagonalObsCovA1": ANY,                   # short-range correlation amplitude (South America fit)
+    "OffDiagonalObsCovL1": ANY,                   # short-range correlation length (km)
+    "OffDiagonalObsCovA2": ANY,                   # transport-tail amplitude
+    "OffDiagonalObsCovL2": ANY,                   # transport-tail length (km)
+    "OffDiagonalObsCovTemporalRho": ANY,          # adjacent-day temporal correlation
+    "OffDiagonalObsCovCutoffKm": ANY,             # spatial cutoff (km); default 3*L2
+    "UseResidualObsError": bool,                  # use the REM diagonal So file directly
     # ReducedDimensionStateVector-related
     "ClusteringMethod": str,
     "NumberOfElements": int,
@@ -275,6 +310,13 @@ def validate_config(cfg: Dict[str, Any]) -> Tuple[bool, List[str]]:
     for controller, dependents in conditional_dict.items():
         if controller in cfg and _truthy_for_condition(cfg[controller]):
             required_keys.update(dependents)
+
+    # ObservationOnlyJacobianCache supplies the Jacobian directly as the merged
+    # K_{start}_{end}.npz cache (read by invert.py load_merged_jacobian_products),
+    # so a PrecomputedJacobian run does NOT need a ReferenceRunDir / data_converted
+    # reference in that mode.
+    if _truthy_for_condition(cfg.get("ObservationOnlyJacobianCache", False)):
+        required_keys.discard("ReferenceRunDir")
 
     # 3) Presence after conditionals
     missing_after = [k for k in required_keys if k not in cfg]

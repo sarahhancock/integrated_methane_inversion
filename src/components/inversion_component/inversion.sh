@@ -25,7 +25,7 @@ setup_inversion() {
     fi
 
     cp ${InversionPath}/src/inversion_scripts/invert.py inversion/
-    cp ${InversionPath}/src/inversion_scripts/positivity_solvers.py inversion/
+    cp ${InversionPath}/src/inversion_scripts/softplus_invert.py inversion/
     cp ${InversionPath}/src/inversion_scripts/lognormal_invert.py inversion/
     cp ${InversionPath}/src/inversion_scripts/jacobian.py inversion/
     cp ${InversionPath}/src/inversion_scripts/operators/*.py inversion/operators/
@@ -36,7 +36,7 @@ setup_inversion() {
     cp ${InversionPath}/src/inversion_scripts/classify_TROPOMI_obs_to_CSgrids.py inversion/
     cp ${InversionPath}/src/inversion_scripts/merge_partial_k.py inversion/
     cp ${InversionPath}/src/inversion_scripts/run_inversion.sh inversion/
-    cp ${InversionPath}/src/inversion_scripts/build_full_prior_covariance.py inversion/
+    cp ${InversionPath}/src/inversion_scripts/build_length_scale_prior_covariance.py inversion/
     cp ${InversionPath}/src/inversion_scripts/build_national_inventory_prior_covariance.py inversion/
     cp ${InversionPath}/src/inversion_scripts/build_sector_ensemble_prior_covariance.py inversion/
     cp ${InversionPath}/src/notebooks/visualization_notebook.ipynb inversion/

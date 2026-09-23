@@ -175,12 +175,13 @@ fi
 #=======================================================================
 if "$OffDiagonalPriorCov"; then
     PriorCovarianceMethod="${PriorCovarianceMethod:-length_scale}"
+    # All three builders take the same CLI: state vector, prior emissions, config, dates, nBuffer.
     if [[ "$PriorCovarianceMethod" == "national_inventory" ]]; then
         python build_national_inventory_prior_covariance.py $StateVectorFile $PriorEmisDir $configPath $StartDate $EndDate $nBufferClusters; wait
     elif [[ "$PriorCovarianceMethod" == "sector_ensemble" ]]; then
         python build_sector_ensemble_prior_covariance.py $StateVectorFile $PriorEmisDir $configPath $StartDate $EndDate $nBufferClusters; wait
-    else
-        python build_full_prior_covariance.py $StateVectorFile $PriorEmisDir $LengthScalePriorCov $StartDate $EndDate $nBufferClusters; wait
+    else   # length_scale (default): spatial decay x sector similarity (Balasus et al. 2026)
+        python build_length_scale_prior_covariance.py $StateVectorFile $PriorEmisDir $configPath $StartDate $EndDate $nBufferClusters; wait
     fi
     # Sequential-KF RTPS inflation: for period>1, relax the previous period's posterior covariance
     # back toward this static Sa0 (Whitaker & Hamill 2012; Pendergrass et al. 2025 Eq. 8), replacing
@@ -225,13 +226,39 @@ MergedY="${MergedDir}/y/y_${StartDate}_${EndDate}.npz"
 MergedPrior="${MergedDir}/xch4_0/xch4_0_${StartDate}_${EndDate}.npz"
 MergedSo="${MergedDir}/so/so_${StartDate}_${EndDate}.npz"
 MergedObs="${MergedDir}/observations/observations_${StartDate}_${EndDate}.npz"
+# ReuseCachedJacobianK: reuse a prebuilt merged Jacobian K_{start}_{end}.npz (from
+# CachedJacobianKDir) while STILL re-running the prior simulation each Kalman period, so the
+# prior XCH4 reflects the propagated initial condition. We sample the prior observation-only
+# (no perturbation-Jacobian rebuild) and emit the fresh obs products with K missing, then
+# stage the cached K for invert.py. Gated so the standard/monthly inversion paths are
+# unchanged (they never set ReuseCachedJacobianK).
+MergePrecomp="$PrecomputedJacobian"
+if "${ReuseCachedJacobianK:-false}"; then
+    buildJacobian="False"
+    MergePrecomp="False"
+    AllowMissingK="True"
+    # Use invert.py's merged-K path (jacobian_sf=None). The cached K is in RELATIVE terms
+    # (defined about the original prior), so it is scaled to this period's NUDGED prior via
+    # NudgedScaleFactorPath=ScaleFactors.nc (the same SF prepare_sf applied to HEMCO), with
+    # AdjustPriorWithScaleFactors=false since the prior sim already ran at the nudged emissions.
+    jacobian_sf="None"
+fi
+MergedResidualSo="${MergedDir}/obs_error_covariance/so_${StartDate}_${EndDate}.npz"
 ReuseMerged=false
 if ! "$LognormalErrors" && [[ -f "$MergedK" ]] && [[ -f "$MergedY" ]] && [[ -f "$MergedPrior" ]] && [[ -f "$MergedSo" ]]; then
     ReuseMerged=true
+    # invert.py hard-requires the REM diagonal So when UseResidualObsError=true; don't reuse a merged
+    # month that lacks it (invert.py would FileNotFoundError) -- rebuild the obs products instead.
+    if [[ "${UseResidualObsError:-false}" == "true" ]] && [[ ! -f "$MergedResidualSo" ]]; then
+        ReuseMerged=false
+        printf "Merged products exist but REM So missing (%s); rebuilding.\n" "$MergedResidualSo"
+    fi
 fi
 if [[ "$ObsProductsOnly" == "true" ]] && [[ -f "$MergedObs" ]] && [[ -f "$MergedY" ]] && [[ -f "$MergedPrior" ]] && [[ -f "$MergedSo" ]]; then
     ReuseMerged=true
 fi
+# ReuseCachedJacobianK always regenerates the prior XCH4 for IC propagation -> never reuse a merged month.
+if "${ReuseCachedJacobianK:-false}"; then ReuseMerged=false; fi
 
 if "$ReuseMerged"; then
     printf "Reusing existing merged inversion products for %s -> %s\n\n" "$StartDate" "$EndDate"
@@ -250,8 +277,34 @@ else
     printf " DONE -- jacobian.py\n\n"
 
     printf "Calling merge_partial_k.py\n"
-    python ${InvDir}/merge_partial_k.py $JacobianDir $StateVectorFile ${OutputPath}/${RunName}/config_${RunName}.yml $PrecomputedJacobian $AllowMissingK
+    python ${InvDir}/merge_partial_k.py $JacobianDir $StateVectorFile ${OutputPath}/${RunName}/config_${RunName}.yml $MergePrecomp $AllowMissingK
     printf "DONE -- merge_partial_k.py\n\n"
+
+    if "${ReuseCachedJacobianK:-false}"; then
+        cachedK="${CachedJacobianKDir:?ReuseCachedJacobianK requires CachedJacobianKDir}/K_${StartDate}_${EndDate}.npz"
+        [ -f "$cachedK" ] || { echo "ERROR: ReuseCachedJacobianK: cached K not found: $cachedK" >&2; exit 1; }
+        mkdir -p "${MergedDir}/K"
+        cp -f "$cachedK" "${MergedDir}/K/K_${StartDate}_${EndDate}.npz"
+        printf "Staged cached Jacobian K for %s->%s from %s\n\n" "$StartDate" "$EndDate" "$cachedK"
+    fi
+
+    #===================================================================
+    # Build the observational error covariance (So): a data-driven per-cell REM diagonal
+    # (Chen et al. 2023) plus off-diagonal spatial correlations. This MUST run before the
+    # transient *_GCtoTROPOMI.pkl files are deleted below, because the REM diagonal is
+    # estimated from those individual-pixel residuals.
+    #===================================================================
+    OffDiagonalObsCov="${OffDiagonalObsCov:-true}"   # default ON: data-driven per-cell REM So (not the fixed uniform ObsError)
+    if "$OffDiagonalObsCov"; then
+        printf "Calling build_obs_error_covariance.py\n"
+        python ${InvDir}/build_obs_error_covariance.py \
+            --start $StartDate \
+            --end $EndDate \
+            --run-root "${OutputPath}/${RunName}" \
+            --state-vector $StateVectorFile \
+            --obs-error-name "${ObsError:-15.0}"; wait
+        printf "DONE -- build_obs_error_covariance.py\n\n"
+    fi
 
     if ! "$PrecomputedJacobian"; then
         printf "Cleaning transient Jacobian observation-space files\n"
@@ -259,22 +312,6 @@ else
         find "${InvDir}/data_visualization" -type f -name '*.pkl' -delete 2>/dev/null || true
         printf "DONE -- cleanup transient Jacobian files\n\n"
     fi
-fi
-
-#=======================================================================
-# Optionally build residual-error observational error covariance (So)
-# with off-diagonal spatial correlations derived from residual anomalies
-#=======================================================================
-OffDiagonalObsCov="${OffDiagonalObsCov:-true}"   # default ON: data-driven per-cell REM So (not the fixed uniform ObsError)
-if "$OffDiagonalObsCov"; then
-    printf "Calling build_residual_obs_covariance.py\n"
-    python ${InvDir}/build_residual_obs_covariance.py \
-        --start $StartDate \
-        --end $EndDate \
-        --run-root "${OutputPath}/${RunName}" \
-        --state-vector $StateVectorFile \
-        --obs-error-name "${ObsError:-15.0}"; wait
-    printf "DONE -- build_residual_obs_covariance.py\n\n"
 fi
 
 if [[ "$ObsProductsOnly" == "true" ]]; then

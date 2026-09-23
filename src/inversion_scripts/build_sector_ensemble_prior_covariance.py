@@ -204,6 +204,7 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
             "NationalPriorUncertaintyFile to use the Saunois global sectoral defaults."
         )
     using_global_defaults = not uncertainty_path
+    country_fraction = None
     if using_global_defaults:
         print("NationalPriorUncertaintyFile not set; using Saunois et al. global sectoral defaults for the anthro block.")
         uncertainty_rows = build_saunois_default_table()
@@ -213,7 +214,15 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
         if country_mask_path:
             country_mask = load_country_mask(country_mask_path, country_mask_var)
         else:
-            country_mask = build_country_mask_from_shapes(uncertainty_rows, prior, config)
+            country_mask, country_fraction = build_country_mask_from_shapes(uncertainty_rows, prior, config)
+    # DOMAIN-INVARIANT national term (opt-in, default OFF): scale each country's national rank-1 by
+    # 1/f_C^2 (f_C = in-domain emission-area fraction) so a partial country isn't pinned to its whole
+    # national total. Needs the shapefile mask; unchanged for fully-in-domain countries (f_C=1).
+    if str(config.get("NationalPriorDomainInvariant", False)).strip().lower() not in ("true", "1", "yes"):
+        country_fraction = None
+    elif country_fraction is not None:
+        print(f"Domain-invariant national term ON: f_C for {len(country_fraction)} countries "
+              f"(min {min(country_fraction.values()):.2f}, max {max(country_fraction.values()):.2f}).")
 
     rows, totals_by_element, neff_sum, neff_sumsq = emission_weighted_element_table(
         state_vector_subset, country_mask, prior, sector_fields, roi_ids
@@ -239,7 +248,8 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
         print("Global background (Saunois) ON for anthro: GLOBAL systematic peeled from u_BTR (national "
               "aggregates unchanged) and added domain-wide, so continental/global aggregates keep a Saunois floor.")
     Sa_abs, tc_diag = two_component_absolute(
-        rows, neff_sum, neff_sumsq, anthro_rows, n, grid_national_ratio, min_uncertainty, global_background
+        rows, neff_sum, neff_sumsq, anthro_rows, n, grid_national_ratio, min_uncertainty, global_background,
+        country_fraction=country_fraction,
     )
     diagnostics.extend(tc_diag)
     if not tc_diag:
@@ -317,15 +327,15 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
         # as u_res = sqrt(u_BTR^2 - g^2) for anthro). c_s clips at 0 if the local aggregate already exceeds g_s.
         # Defaults to SAUNOIS_GLOBAL_BACKGROUND; ON by default.
         gbg = None
-        if str(config.get("SectorEnsembleGenericGlobalBackground", True)).strip().lower() in ("true", "1", "yes"):
+        if str(config.get("SectorEnsembleGenericGlobalBackground", True)).strip().lower() in ("true", "1", "yes"):   # default ON
             gbg = dict(SAUNOIS_GLOBAL_BACKGROUND)
             gbg.update(config.get("SectorEnsembleGenericGlobalBackgroundValues", {}) or {})
             for s in generic_sectors:
                 g = float(gbg.get(s, 0.0)); es = sector_emis[s]; Es = float(es.sum())
                 if g <= 0.0 or Es <= 0.0:
                     continue
-                local_var = generic_sigma * generic_sigma * float(es @ K_gen @ e_non)   # sector s's continental var from the local block
-                c = max(g * g - local_var / (Es * Es), 0.0)                              # PEEL: local + floor = g_s exactly
+                local_var = generic_sigma * generic_sigma * float(es @ K_gen @ es)       # sector s's OWN continental variance
+                c = max(g * g - local_var / (Es * Es), 0.0)                              # FLOOR: local + floor = g_s exactly
                 Sa_abs += c * np.outer(es, es)
         for s in generic_sectors:                                           # per-sector diagnostics
             es = sector_emis[s]

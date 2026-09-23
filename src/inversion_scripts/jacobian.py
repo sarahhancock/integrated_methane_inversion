@@ -149,6 +149,12 @@ if __name__ == "__main__":
     else:
         build_jacobian = False
     obs_only_cache = bool(config.get("ObservationOnlyJacobianCache", False))
+    # The residual-error (REM) diagonal + off-diagonal So need the unaveraged individual pixels
+    # (viz_output), so still produce them even in obs-only-cache mode when either is requested.
+    rem_needs_viz = (
+        str(config.get("OffDiagonalObsCov", True)).strip().lower() in ("true", "1", "yes")
+        or str(config.get("UseResidualObsError", False)).strip().lower() in ("true", "1", "yes")
+    )
     if isPost.lower() == "false":  # if sampling prior simulation
         gc_cache = f"{workdir}/data_geoschem"
         outputdir = f"{workdir}/data_converted"
@@ -250,8 +256,9 @@ if __name__ == "__main__":
             )
 
             # we also save out the unaveraged satellite operator for visualization purposes
+            # (also the individual-pixel source the REM diagonal / off-diagonal So consume)
             viz_output = None
-            if not obs_only_cache:
+            if (not obs_only_cache) or rem_needs_viz:
                 viz_output = apply_operator(
                     "satellite",
                     {

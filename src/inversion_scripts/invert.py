@@ -27,7 +27,7 @@ from src.inversion_scripts.utils import (
     update_prior_error_for_OptimizeSoil,
     map_files_to_reference,
 )
-from src.inversion_scripts.positivity_solvers import (
+from src.inversion_scripts.softplus_invert import (
     run_softplus,
     inversion_diagnostics,
 )
@@ -38,6 +38,20 @@ from src.utilities.config_utils import load_config
 SOFTPLUS_SCALE_DEFAULT = 0.1
 # Levenberg-Marquardt damping for the positivity solvers (Chen et al., 2022).
 POSITIVITY_KAPPA = 10.0
+
+
+def resolve_inversion_method(config):
+    """Resolve the analytical-path inversion solver from config.
+
+    `SoftplusErrors: true` is the documented flag that selects the softplus positivity solver
+    (parallel to `LognormalErrors: true`). `InversionMethod: softplus` is still honored for
+    back-compat. Returns "analytical" (default) or "softplus". Lognormal is handled separately
+    via `LognormalErrors` in run_inversion.sh before invert.py is called.
+    """
+    method = str(config.get("InversionMethod", "analytical"))
+    if bool(config.get("SoftplusErrors", False)):
+        method = "softplus"
+    return method
 
 
 def align_obs_rows_with_reference(obs_GC, obs_GC_ref):
@@ -221,55 +235,12 @@ def invert_prior_covariance(Sa, Sa_constraint, use_full_prior_covariance):
     return np.diag(1 / Sa_constraint), np.diag(1 / Sa)
 
 
-def load_so_corr_params(run_root, start, end):
-    """Load spatial correlation parameters for off-diagonal So.
-
-    Prefers the two-exponential model (short near-field + broad transport tail, applied
-    with no taper) written by build_residual_obs_covariance.py.  Falls back to the smoothed
-    empirical lookup, then to the single-exponential fit.
-
-    Returns a dict with one of:
-      {"form": "two_exponential", "corr_amplitude1/length1_km", "corr_amplitude2/length2_km", "corr_cutoff_km"}
-      {"form": "empirical", "empirical_d_km", "empirical_rho", "corr_cutoff_km"}
-      {"form": "exponential", "corr_amplitude", "corr_length_km", "corr_cutoff_km"}
-    or None if the file does not exist.
-    """
-    path = (
-        Path(run_root) / "inversion_data" / "so_residual_error_method"
-        / f"so_residual_error_correlation_{start}_{end}.npz"
-    )
-    if not path.exists():
-        return None
-    with np.load(path, allow_pickle=False) as f:
-        keys = set(f.files)
-        try:
-            form = bytes(f["functional_form"]).decode() if "functional_form" in keys else ""
-        except Exception:
-            form = ""
-        if form == "two_exponential" and "corr_amplitude1" in keys:
-            return {
-                "form": "two_exponential",
-                "corr_amplitude1": float(f["corr_amplitude1"]),
-                "corr_length1_km": float(f["corr_length1_km"]),
-                "corr_amplitude2": float(f["corr_amplitude2"]),
-                "corr_length2_km": float(f["corr_length2_km"]),
-                "corr_cutoff_km": float(f["corr_cutoff_km"]),
-            }
-        if "empirical_d_km" in keys and "empirical_rho" in keys:
-            cutoff = float(f["empirical_cutoff_km"]) if "empirical_cutoff_km" in keys \
-                else float(f.get("corr_cutoff_km", 375.0))
-            return {
-                "form": "empirical",
-                "empirical_d_km": f["empirical_d_km"].astype(np.float64),
-                "empirical_rho":  f["empirical_rho"].astype(np.float64),
-                "corr_cutoff_km": cutoff,
-            }
-        return {
-            "form": "exponential",
-            "corr_amplitude": float(f["corr_amplitude"]),
-            "corr_length_km": float(f["corr_length_km"]),
-            "corr_cutoff_km": float(f["corr_cutoff_km"]),
-        }
+# NOTE: the off-diagonal So spatial correlation is configured directly from the OffDiagonalObsCov*
+# config keys -- the fixed South America two-exponential fit (see the so_corr_params dict built in
+# __main__). These config keys are the SINGLE SOURCE OF TRUTH for the correlation. The per-region
+# fit that build_obs_error_covariance.py writes to obs_error_covariance/so_correlation_*.npz is a
+# DIAGNOSTIC only and is intentionally not read here. The data-driven part used per region is the
+# REM diagonal So (obs_error_covariance/so_*.npz), built on individual observations.
 
 
 def build_sparse_so_correction(lat, lon, corr_params):
@@ -608,6 +579,80 @@ def build_offdiag_so_normal_equations(
     return KTinvSoK, KTinvSoy, ytinvSoy
 
 
+def compute_so_normal_equations(K, delta_y_vec, obs_error, lat, lon, dates, so_corr_params):
+    """Observation-error normal-equation products for ANY solver (normal, softplus, lognormal):
+
+        KTinvSoK = K^T So^-1 K
+        KTinvSoy = K^T So^-1 (y - F(xA))
+        ytinvSoy = (y - F(xA))^T So^-1 (y - F(xA))
+
+    So is a SINGLE, solver-independent choice: a per-observation diagonal (obs_error) optionally
+    combined with a same-day off-diagonal correlation (so_corr_params). The two-exponential form is
+    applied EXACTLY (day-blocked block-Thomas); weaker empirical/single-exponential forms use the
+    first-order Woodbury correction; with so_corr_params=None it is the plain diagonal So. This is the
+    ONE place So^-1 is applied, so every solver sees identical observation weighting.
+    Returns (KTinvSoK, KTinvSoy, ytinvSoy).
+    """
+    K = np.asarray(K, dtype=float)
+    delta_y_vec = np.asarray(delta_y_vec, dtype=float)
+    obs_error = np.asarray(obs_error, dtype=float)
+    form = so_corr_params.get("form") if so_corr_params is not None else None
+    if form == "two_exponential" and not (lat is not None and lon is not None and dates is not None):
+        raise ValueError(
+            "Off-diagonal So (two-exponential) requires per-observation lat, lon, and dates for the "
+            "exact day-blocked solve. Provide observation metadata (merged monthly path)."
+        )
+    exact_offdiag = so_corr_params is not None and form == "two_exponential"
+    if exact_offdiag:
+        temporal_rho = float(so_corr_params.get("temporal_rho", 0.0))
+        KTinvSoK, KTinvSoy, ytinvSoy = build_offdiag_so_normal_equations(
+            K, delta_y_vec, obs_error, lat, lon, dates, so_corr_params, temporal_rho=temporal_rho,
+        )
+        print(f"  Off-diagonal So applied EXACTLY (two-exponential, day-blocked block-Thomas: "
+              f"A1={so_corr_params['corr_amplitude1']:.3f} L1={so_corr_params['corr_length1_km']:.0f} km, "
+              f"A2={so_corr_params['corr_amplitude2']:.3f} L2={so_corr_params['corr_length2_km']:.0f} km, "
+              f"no taper, cutoff={so_corr_params['corr_cutoff_km']:.0f} km, temporal_rho={temporal_rho})")
+    else:
+        # Diagonal So, with an optional first-order (Woodbury) off-diagonal correction (weak correlation only).
+        KTinvSo = K.transpose() / obs_error
+        KTinvSoK = KTinvSo @ K
+        KTinvSoy = KTinvSo @ delta_y_vec
+        ytinvSoy = float(delta_y_vec @ (delta_y_vec / obs_error))
+        if so_corr_params is not None and lat is not None and lon is not None:
+            P_corr = build_sparse_so_correction(lat, lon, so_corr_params)
+            if P_corr is not None:
+                diag = diagnose_sparse_so_correction(P_corr)
+                print(
+                    "  Off-diagonal So diagnostics: "
+                    f"nnz={diag['nnz']:,}, max_abs_row_sum={diag['max_abs_row_sum']:.3f}, "
+                    f"min_eig(I+P) sample={diag['min_eig_I_plus_P_sample']:.3e}, "
+                    f"min_eig(I-P) sample={diag['min_eig_I_minus_P_sample']:.3e}"
+                )
+                if not diag["usable"]:
+                    print(
+                        "Warning: skipping off-diagonal So correction because "
+                        f"{diag.get('reason', 'diagnostics failed')}. Using diagonal So."
+                    )
+                    P_corr = None
+            if P_corr is not None:
+                corr_KTinvSoK, corr_KTinvSo_dy = apply_so_offdiag_correction(
+                    K, delta_y_vec, obs_error, P_corr
+                )
+                inv_sqrt_s = 1.0 / np.sqrt(obs_error)
+                weighted_dy = delta_y_vec * inv_sqrt_s
+                KTinvSoK = KTinvSoK - corr_KTinvSoK
+                KTinvSoy = KTinvSoy - corr_KTinvSo_dy
+                ytinvSoy = ytinvSoy - float(weighted_dy @ (P_corr @ weighted_dy))
+                if form == "empirical":
+                    print(f"  Off-diagonal So correction applied (first-order, "
+                          f"empirical rho, cutoff={so_corr_params['corr_cutoff_km']:.0f} km)")
+                else:
+                    print(f"  Off-diagonal So correction applied (first-order, "
+                          f"A={so_corr_params.get('corr_amplitude', float('nan')):.3f}, "
+                          f"L={so_corr_params.get('corr_length_km', float('nan')):.0f} km)")
+    return KTinvSoK, KTinvSoy, ytinvSoy
+
+
 def solve_inversion_from_k(
     K,
     delta_y,
@@ -665,67 +710,13 @@ def solve_inversion_from_k(
     K = np.asarray(K, dtype=float)
     delta_y_vec = np.asarray(delta_y["delta_y"], dtype=float)
 
-    # ---- Observation-error normal-equation products: K^T So^-1 K, K^T So^-1 dy, dy^T So^-1 dy ----
+    # ---- Observation-error normal-equation products (shared solver-independent So operator) ----
     lat = np.asarray(delta_y["lat"], dtype=float) if "lat" in delta_y else None
     lon = np.asarray(delta_y["lon"], dtype=float) if "lon" in delta_y else None
     dates = delta_y.get("dates", None)
-    form = so_corr_params.get("form") if so_corr_params is not None else None
-    # The two-exponential residual-error So is ALWAYS applied EXACTLY (day-blocked block-Thomas),
-    # matching the production inversion; it is valid for strong correlation, unlike the first-order
-    # Woodbury correction (which remains only for the weaker empirical/single-exponential forms).
-    if form == "two_exponential" and not (lat is not None and lon is not None and dates is not None):
-        raise ValueError(
-            "Off-diagonal So (two-exponential) requires per-observation lat, lon, and dates for the "
-            "exact day-blocked solve. Provide observation metadata (merged monthly path)."
-        )
-    exact_offdiag = so_corr_params is not None and form == "two_exponential"
-    if exact_offdiag:
-        temporal_rho = float(so_corr_params.get("temporal_rho", 0.0))
-        KTinvSoK, KTinvSoyKxA, ytinvSoy = build_offdiag_so_normal_equations(
-            K, delta_y_vec, obs_error, lat, lon, dates, so_corr_params, temporal_rho=temporal_rho,
-        )
-        print(f"  Off-diagonal So applied EXACTLY (two-exponential, day-blocked block-Thomas: "
-              f"A1={so_corr_params['corr_amplitude1']:.3f} L1={so_corr_params['corr_length1_km']:.0f} km, "
-              f"A2={so_corr_params['corr_amplitude2']:.3f} L2={so_corr_params['corr_length2_km']:.0f} km, "
-              f"no taper, cutoff={so_corr_params['corr_cutoff_km']:.0f} km, temporal_rho={temporal_rho})")
-    else:
-        # Diagonal So, with an optional first-order (Woodbury) off-diagonal correction (weak correlation only).
-        KTinvSo = K.transpose() / obs_error
-        KTinvSoK = KTinvSo @ K
-        KTinvSoyKxA = KTinvSo @ delta_y_vec
-        ytinvSoy = float(delta_y_vec @ (delta_y_vec / obs_error))
-        if so_corr_params is not None and lat is not None and lon is not None:
-            P_corr = build_sparse_so_correction(lat, lon, so_corr_params)
-            if P_corr is not None:
-                diag = diagnose_sparse_so_correction(P_corr)
-                print(
-                    "  Off-diagonal So diagnostics: "
-                    f"nnz={diag['nnz']:,}, max_abs_row_sum={diag['max_abs_row_sum']:.3f}, "
-                    f"min_eig(I+P) sample={diag['min_eig_I_plus_P_sample']:.3e}, "
-                    f"min_eig(I-P) sample={diag['min_eig_I_minus_P_sample']:.3e}"
-                )
-                if not diag["usable"]:
-                    print(
-                        "Warning: skipping off-diagonal So correction because "
-                        f"{diag.get('reason', 'diagnostics failed')}. Using diagonal So."
-                    )
-                    P_corr = None
-            if P_corr is not None:
-                corr_KTinvSoK, corr_KTinvSo_dy = apply_so_offdiag_correction(
-                    K, delta_y_vec, obs_error, P_corr
-                )
-                inv_sqrt_s = 1.0 / np.sqrt(obs_error)
-                weighted_dy = delta_y_vec * inv_sqrt_s
-                KTinvSoK = KTinvSoK - corr_KTinvSoK
-                KTinvSoyKxA = KTinvSoyKxA - corr_KTinvSo_dy
-                ytinvSoy = ytinvSoy - float(weighted_dy @ (P_corr @ weighted_dy))
-                if form == "empirical":
-                    print(f"  Off-diagonal So correction applied (first-order, "
-                          f"empirical rho, cutoff={so_corr_params['corr_cutoff_km']:.0f} km)")
-                else:
-                    print(f"  Off-diagonal So correction applied (first-order, "
-                          f"A={so_corr_params.get('corr_amplitude', float('nan')):.3f}, "
-                          f"L={so_corr_params.get('corr_length_km', float('nan')):.0f} km)")
+    KTinvSoK, KTinvSoyKxA, ytinvSoy = compute_so_normal_equations(
+        K, delta_y_vec, obs_error, lat, lon, dates, so_corr_params
+    )
 
     method = str(inversion_method or "analytical").lower()
     n_obs = int(K.shape[0])
@@ -765,7 +756,8 @@ def solve_inversion_from_k(
     else:
         raise ValueError(
             f"Unsupported InversionMethod={inversion_method!r}. "
-            "Use 'analytical' or 'softplus' (lognormal errors use LognormalErrors=true)."
+            "Use the analytical (default) solver, set SoftplusErrors: true for the softplus "
+            "positivity solver, or LognormalErrors: true for lognormal errors."
         )
 
     print(
@@ -868,7 +860,7 @@ def load_merged_jacobian_products(config, StateVectorFile=None):
     if bool(config.get("UseResidualObsError", False)):
         residual_so_path = (
             inversion_data
-            / "so_residual_error_method"
+            / "obs_error_covariance"
             / f"so_{start}_{end}.npz"
         )
         if not residual_so_path.exists():
@@ -1579,8 +1571,13 @@ if __name__ == "__main__":
     prior_err = ensure_float_list(config["PriorError"])
     obs_err = ensure_float_list(config["ObsError"])
     gamma = ensure_float_list(config["Gamma"])
-    inversion_method = str(config.get("InversionMethod", "analytical"))
+    # Solver selection. `SoftplusErrors: true` is the documented flag (parallel to
+    # `LognormalErrors: true`) that turns on the softplus positivity solver;
+    # `InversionMethod: softplus` remains honored for back-compat.
+    inversion_method = resolve_inversion_method(config)
     softplus_scale = float(config.get("SoftplusScale", SOFTPLUS_SCALE_DEFAULT))
+    # NOTE: MaxScaleFactor / MaxTrueScaleFactor are read and threaded but not currently
+    # applied (no clamp); left inert intentionally (uncapped solves). Not a documented key.
     max_scale_factor = config.get("MaxScaleFactor", None)
     max_true_scale_factor = config.get("MaxTrueScaleFactor", None)
 
@@ -1605,7 +1602,7 @@ if __name__ == "__main__":
     if jacobian_sf == "None":
         jacobian_sf = None
 
-    use_offdiag_so = bool(config.get("OffDiagonalObsCov", False))
+    use_offdiag_so = bool(config.get("OffDiagonalObsCov", True))  # default ON (matches config.yml + run_inversion.sh)
 
     merged_products = load_merged_jacobian_products(config, StateVectorFile)
     if merged_products is not None and jacobian_sf is None:
@@ -1680,18 +1677,23 @@ if __name__ == "__main__":
         # large for the merged path.  It solves the standard analytical (normal)
         # inversion only; the softplus positivity solver and off-diagonal So need the
         # merged path (they operate on the full assembled system).
+        # NOTE: PrecomputedJacobian=true sets jacobian_sf (non-None), which routes execution here
+        # (the merged path above requires jacobian_sf is None), so a precomputed-Jacobian re-run with
+        # the default OffDiagonalObsCov/softplus lands on these guards.
         if use_offdiag_so:
             raise RuntimeError(
-                "OffDiagonalObsCov=true requires merged monthly inversion products "
-                "with observation latitude/longitude metadata. The day-level pickle "
-                "fallback path cannot apply residual-correlation So."
+                "OffDiagonalObsCov=true requires the merged monthly inversion products with "
+                "observation latitude/longitude metadata; the day-level pickle fallback path cannot "
+                "apply residual-correlation So. This path is taken when PrecomputedJacobian=true "
+                "(jacobian_sf is set). For a precomputed-Jacobian re-run, set OffDiagonalObsCov: false, "
+                "or run the full (non-precomputed) merged path."
             )
         if str(inversion_method).lower() not in ("analytical", "normal", "gaussian"):
             raise RuntimeError(
-                f"InversionMethod={inversion_method} requires the merged monthly "
-                "inversion path; the day-level streaming path supports only the "
-                "analytical (normal) inversion. Set InversionMethod: analytical, or "
-                "provide merged monthly products to use softplus."
+                f"InversionMethod={inversion_method} requires the merged monthly inversion path; the "
+                "day-level streaming path supports only the analytical (normal) inversion. This path is "
+                "taken when PrecomputedJacobian=true (jacobian_sf is set). Set InversionMethod/solver to "
+                "normal for a precomputed-Jacobian re-run, or use the full merged path for softplus/lognormal."
             )
         gc_startdate = np.datetime64(datetime.datetime.strptime(str(config['StartDate']), "%Y%m%d"))
         gc_enddate = np.datetime64(datetime.datetime.strptime(str(config['EndDate']), "%Y%m%d"))
