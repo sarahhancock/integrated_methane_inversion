@@ -57,6 +57,23 @@ def test_matches_analytical_when_comfortably_positive():
     assert np.allclose(xhat_sp, xhat_an, atol=0.05)   # near-linear regime -> matches the linear solve
 
 
+def test_returns_normal_averaging_kernel():
+    # The reported averaging kernel must be the NORMAL (linear) one -- data resolution
+    # A = (gamma K^T So^-1 K + Sa^-1)^-1 (gamma K^T So^-1 K) -- NOT the transform-space kernel, and its
+    # trace over the ROI must equal the reported DOFS.
+    n, n_obs = 5, 400
+    delta_true = np.array([0.2, -0.25, 0.1, 0.3, -0.15])
+    K, xa, KTinvSoK, KTinvSoy, ytinvSoy, inv_Sa = _linear_problem(n, n_obs, 1, delta_true)
+    gamma = 1.0
+    _, _, _, A, diag, _ = run_softplus(
+        KTinvSoK, KTinvSoy, ytinvSoy, inv_Sa, inv_Sa, n_obs, n, xa, scale=0.1, gamma=gamma
+    )
+    Md = gamma * KTinvSoK
+    A_normal = np.linalg.solve(Md + inv_Sa, Md)      # the linear/analytical averaging kernel
+    assert np.allclose(A, A_normal, atol=1e-10)      # transform-independent, matches the analytical solver
+    assert np.isclose(np.trace(A[:n, :n]), diag["DOFS"], atol=1e-6)   # DOFS = trace of the ROI AK
+
+
 def test_enforces_positivity_where_linear_goes_negative():
     n, n_obs = 4, 400
     delta_true = np.array([-2.5, 0.2, 0.1, 0.0])  # element 0 drives the linear scale factor negative

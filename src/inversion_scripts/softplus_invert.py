@@ -198,7 +198,11 @@ def run_softplus(
     sf, deriv = field(z, variance)
     data_hessian = Md * np.outer(deriv, deriv)
     S_post = np.linalg.inv(data_hessian + inv_Sa)
-    A = S_post @ data_hessian
+    # Report the NORMAL (linear) averaging kernel -- the data resolution
+    # A = (gamma K^T So^-1 K + Sa^-1)^-1 (gamma K^T So^-1 K), with the physical Jacobian. The
+    # resolution the observations provide is a property of K/So/Sa and must NOT be distorted by the
+    # softplus reparametrization; this matches the analytical solver and the reported DOFS.
+    A = np.linalg.solve(Md + inv_Sa, Md)
 
     xhat = sf.copy()
     delta = xhat - x_prior

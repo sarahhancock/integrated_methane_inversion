@@ -75,6 +75,21 @@ def test_roi_block_truncation(tmp_path, monkeypatch):
     assert np.allclose(np.diag(lnSa), np.log1p((0.2 * sigma_scale[:n]) ** 2))
 
 
+def test_physical_prior_recovered_by_expm1(tmp_path, monkeypatch):
+    # The normal-averaging-kernel diagnostic recovers the physical prior covariance from the log block as
+    # Sa_rel = e^{lnSa} - 1 (inverse of lnSa = ln(1 + Sa_rel)). Verify that round-trip.
+    monkeypatch.chdir(tmp_path)
+    n = 3
+    C = np.array([[1.0, 0.4, 0.1], [0.4, 1.0, 0.2], [0.1, 0.2, 1.0]])
+    sigma_scale = np.array([1.0, 2.0, 0.5])
+    _write_prior_npz(tmp_path / "prior_norm_error_covariance.npz", C, sigma_scale)
+    sa = 0.3
+    lnSa, _ = build_lognormal_prior_cov({"OffDiagonalPriorCov": True}, sa, n)
+    sig = sa * sigma_scale
+    Sa_rel = sig[:, None] * C * sig[None, :]
+    assert np.allclose(np.expm1(lnSa), Sa_rel, atol=1e-8)
+
+
 def test_prebuilt_smaller_than_n_raises(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _write_prior_npz(tmp_path / "prior_norm_error_covariance.npz", np.eye(3), np.ones(3))

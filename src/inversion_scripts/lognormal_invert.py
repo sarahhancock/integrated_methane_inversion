@@ -419,8 +419,21 @@ def lognormal_invert(config, state_vector_filepath, jacobian_sf):
 
         print("Status: Done Iterating")
 
-        # Averaging kernel A = Shat @ (gamma K'^T So^-1 K') = lns @ gKTinvSoK (uses unweighted Sa)
-        ak = lns @ gKTinvSoK
+        # NORMAL (linear) averaging kernel for the DOFS diagnostic. The data resolution is a property of
+        # the PHYSICAL Jacobian, So, and prior and must NOT carry the log transform (matches the analytical
+        # and softplus solvers). Use the physical K^T So^-1 K from the untransformed K_full, and the
+        # physical prior covariance: the ROI relative covariance Sa_rel = e^{ln(1+Sa_rel)} - 1 recovered
+        # from the log block, plus the already-physical (unweighted) buffer/BC/OH block.
+        KTinvSoK_phys, _, _ = compute_so_normal_equations(
+            K_full, residual, so, obs_lat, obs_lon, obs_dates, so_corr_params
+        )
+        Md_phys = gamma * KTinvSoK_phys
+        sa_phys = np.zeros((ntot, ntot))
+        sa_phys[:n, :n] = np.expm1(lnSa_ROI)
+        sa_phys[norm_idx, norm_idx] = sa_normal.flatten()
+        w_sp, V_sp = np.linalg.eigh(0.5 * (sa_phys + sa_phys.T))
+        sa_phys = (V_sp * np.clip(w_sp, 1.0e-10, None)) @ V_sp.T
+        ak = np.linalg.solve(Md_phys + np.linalg.inv(sa_phys), Md_phys)
 
         # Calculate Ja diagnostic only for domain of interest (ignoring buffer and BC elements)
         # Ja diagnostic is useful for determining regurlarization parameter (gamma)
