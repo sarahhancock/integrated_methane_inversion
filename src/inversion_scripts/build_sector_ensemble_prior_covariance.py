@@ -58,6 +58,7 @@ try:
         emission_weighted_element_table,
         two_component_absolute,
         default_country_shapefile,
+        domain_invariant_enabled,
         write_diagnostics,
     )
 except ModuleNotFoundError:
@@ -78,6 +79,7 @@ except ModuleNotFoundError:
         emission_weighted_element_table,
         two_component_absolute,
         default_country_shapefile,
+        domain_invariant_enabled,
         write_diagnostics,
     )
 
@@ -221,7 +223,7 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
     # DOMAIN-INVARIANT national term (opt-in, default OFF): scale each country's national rank-1 by
     # 1/f_C^2 (f_C = in-domain emission-area fraction) so a partial country isn't pinned to its whole
     # national total. Needs the shapefile mask; unchanged for fully-in-domain countries (f_C=1).
-    if str(config.get("NationalPriorDomainInvariant", False)).strip().lower() not in ("true", "1", "yes"):
+    if not domain_invariant_enabled(config):
         country_fraction = None
     elif country_fraction is not None:
         print(f"Domain-invariant national term ON: f_C for {len(country_fraction)} countries "

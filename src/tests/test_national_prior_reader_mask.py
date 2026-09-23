@@ -29,6 +29,16 @@ def _write_csv(header, rows):
 
 # --------------------------- read_uncertainty_table ---------------------------
 
+def test_domain_invariant_defaults_on_for_regional():
+    # The domain-invariant national term (1/f_C^2 for partially-in-domain countries) defaults ON for
+    # regional inversions and OFF for global; an explicit key overrides.
+    assert B.domain_invariant_enabled({"isRegional": True}) is True
+    assert B.domain_invariant_enabled({"isRegional": False}) is False
+    assert B.domain_invariant_enabled({}) is True                      # isRegional defaults True
+    assert B.domain_invariant_enabled({"isRegional": True, "NationalPriorDomainInvariant": False}) is False
+    assert B.domain_invariant_enabled({"isRegional": False, "NationalPriorDomainInvariant": True}) is True
+
+
 def test_reader_flexible_columns_and_iso3_identifier():
     path = _write_csv(["iso3", "sector", "u"], [["BRA", "Livestock", "0.5"]])
     try:

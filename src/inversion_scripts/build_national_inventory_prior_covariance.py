@@ -192,54 +192,56 @@ def load_country_shapes(path, name_column):
     return shapes
 
 
-def get_country_fraction_mask(country, lat, lon, shapes, name_column, area_weighting=True):
+def indomain_area_fraction(country_shape, lat, lon):
+    """Fraction of a country's area inside the inversion domain, via a SINGLE polygon intersection with
+    the domain's lon/lat bounding box in an equal-area CRS -- O(1) per country, no per-cell loop. This is
+    the in-domain AREA fraction; it equals the in-domain EMISSION fraction the domain-invariant national
+    term wants only under a uniform-emission-density assumption -- the best estimate available without
+    out-of-domain (global) emissions, which a regional run does not have. Equal-area (EPSG:6933) is used
+    because square-degrees over-weight high latitudes by ~1/cos(lat)."""
     import geopandas as gpd
-    import regionmask
     from shapely.geometry import box
+
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    dlat = float(np.abs(lat[1] - lat[0])) if lat.size > 1 else 0.0
+    dlon = float(np.abs(lon[1] - lon[0])) if lon.size > 1 else 0.0
+    domain_box = gpd.GeoDataFrame(
+        geometry=[box(lon.min() - dlon / 2, lat.min() - dlat / 2,
+                      lon.max() + dlon / 2, lat.max() + dlat / 2)],
+        crs="EPSG:4326",
+    ).to_crs("EPSG:6933")
+    cp = country_shape.to_crs("EPSG:6933")
+    full = float(cp.area.sum())
+    if full <= 0:
+        return 1.0
+    indomain = float(cp.intersection(domain_box.geometry.iloc[0]).area.sum())
+    return min(max(indomain / full, 0.0), 1.0)
+
+
+def get_country_fraction_mask(country, lat, lon, shapes, name_column, area_weighting=True):
+    """Binary in-domain mask for a country (regionmask cell-center assignment) plus the in-domain area
+    fraction f_C for the domain-invariant national term. area_weighting=False returns f_C=1 (national
+    term treated as fully in-domain); True computes f_C via indomain_area_fraction (a cheap polygon clip)."""
+    import regionmask
+    import warnings
 
     country_shape = shapes[shapes[name_column] == country]
     if country_shape.empty:
         raise ValueError(f"Country {country!r} not found in shapefile column {name_column!r}")
 
+    with warnings.catch_warnings():
+        # a country outside the inversion domain legitimately covers no gridpoints (e.g. a global BTR
+        # CSV run over a regional domain) -- silence regionmask's expected all-NaN warning.
+        warnings.filterwarnings("ignore", message="No gridpoint belongs to any region")
+        mask = np.array(regionmask.mask_geopandas(country_shape, lon, lat) + 1)
+    mask[np.isnan(mask)] = 0
+    mask[mask > 0] = 1
+    mask = mask.astype(float)
+
     if not area_weighting:
-        import warnings
-        with warnings.catch_warnings():
-            # a country outside the inversion domain legitimately covers no gridpoints (e.g. a global BTR
-            # CSV run over a regional domain) -- silence regionmask's expected all-NaN warning.
-            warnings.filterwarnings("ignore", message="No gridpoint belongs to any region")
-            mask = np.array(regionmask.mask_geopandas(country_shape, lon, lat) + 1)
-        mask[np.isnan(mask)] = 0
-        mask[mask > 0] = 1
-        return mask.astype(float), 1.0            # binary: in-domain fraction unknown -> f_C=1 (no scaling)
-
-    dlat = float(np.abs(lat[1] - lat[0]))
-    dlon = float(np.abs(lon[1] - lon[0]))
-    grid_cells = []
-    indices = []
-    for i, y in enumerate(lat):
-        for j, x in enumerate(lon):
-            grid_cells.append(box(x - dlon / 2, y - dlat / 2, x + dlon / 2, y + dlat / 2))
-            indices.append((i, j))
-
-    # Compute areas in an equal-area CRS (EPSG:6933, global cylindrical equal-area), NOT the shapefile's
-    # geographic CRS: square-degrees over-weight high latitudes by ~1/cos(lat), which would bias both the
-    # per-cell coverage fraction and the domain-invariant f_C for countries spanning a wide latitude range.
-    EQUAL_AREA_CRS = "EPSG:6933"
-    grid = gpd.GeoDataFrame(geometry=grid_cells, crs="EPSG:4326").to_crs(EQUAL_AREA_CRS)
-    country_projected = country_shape.to_crs(EQUAL_AREA_CRS)
-    mask = np.zeros((len(lat), len(lon)), dtype=float)
-    indomain_area = 0.0
-    for geom, (i, j) in zip(grid.geometry, indices):
-        if geom.is_empty or geom.area == 0:
-            continue
-        intersection = country_projected.intersection(geom)
-        if not intersection.is_empty.all():
-            ia = float(intersection.area.sum())
-            mask[i, j] = ia / geom.area
-            indomain_area += ia                   # accumulate the in-domain country area (projected)
-    full_area = float(country_projected.area.sum())
-    f_c = (indomain_area / full_area) if full_area > 0 else 1.0   # in-domain fraction of the whole country
-    return mask, min(max(f_c, 0.0), 1.0)
+        return mask, 1.0
+    return mask, indomain_area_fraction(country_shape, lat, lon)
 
 
 def default_country_shapefile():
@@ -259,13 +261,24 @@ def default_country_shapefile():
     return None
 
 
+def domain_invariant_enabled(config):
+    """Whether the domain-invariant national term is on -- scale the national variance by 1/f_C^2 for a
+    country only partly in the domain. Defaults ON for regional inversions (config isRegional): it is the
+    faithful treatment of whole-country BTR uncertainties and a no-op for fully-in-domain countries
+    (f_C=1). An explicit NationalPriorDomainInvariant overrides the default."""
+    val = config.get("NationalPriorDomainInvariant", None)
+    if val is None:
+        return str(config.get("isRegional", True)).strip().lower() in ("true", "1", "yes")
+    return str(val).strip().lower() in ("true", "1", "yes")
+
+
 def build_country_mask_from_shapes(uncertainty_rows, prior, config):
     # Default to the bundled global shapefile so any IMI user gets per-country masks with no setup.
     shapefile = config.get("NationalPriorCountryShapefile") or default_country_shapefile()
     name_column = config.get("NationalPriorCountryNameColumn", "NAME")
-    # Area-weighted per-cell coverage is only needed for the domain-invariant f_C (1/f_C^2); otherwise
-    # use the fast regionmask path (f_C=1). Default follows NationalPriorDomainInvariant.
-    domain_invariant = str(config.get("NationalPriorDomainInvariant", False)).strip().lower() in ("true", "1", "yes")
+    # Compute the in-domain area fraction f_C (a cheap polygon clip per country) when the domain-invariant
+    # national term is on (default on for regional inversions); f_C=1 otherwise.
+    domain_invariant = domain_invariant_enabled(config)
     area_weighting = bool(config.get("NationalPriorCountryMaskAreaWeighting", domain_invariant))
     if not shapefile:
         return None, None
@@ -298,6 +311,8 @@ def build_country_mask_from_shapes(uncertainty_rows, prior, config):
         except ValueError as exc:
             print(f"  Country mask: {exc}; skipping {country_name!r}.")
             continue
+        if not np.any(fraction > 0):
+            continue                                          # country has no cells in the domain -> ignore it
         next_id = max(next_id, country_id + 1)
         current = mask.values
         replace = fraction > best_fraction                    # assign each cell to the country covering the MOST of it
@@ -312,7 +327,7 @@ def build_country_mask_from_shapes(uncertainty_rows, prior, config):
     # its national uncertainty is then applied as if the whole country were in-domain, which over-
     # constrains the in-domain part (the Nigeria-style partially-in-domain case). A cheap geometry-
     # bbox vs grid-bounds check -- no extra area computation.
-    domain_invariant_on = str(config.get("NationalPriorDomainInvariant", False)).strip().lower() in ("true", "1", "yes")
+    domain_invariant_on = domain_invariant_enabled(config)
     if not domain_invariant_on and country_lookup:
         lon = prior.lon.values
         lat = prior.lat.values
@@ -671,10 +686,10 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
             country_mask = load_country_mask(country_mask_path, country_mask_var)
         else:
             country_mask, country_fraction = build_country_mask_from_shapes(uncertainty_rows, prior, config)
-    # DOMAIN-INVARIANT national term (opt-in): scale each country's national rank-1 by 1/f_C^2 so a
-    # partially-in-domain country is not pinned to its whole-country total. Needs the shapefile mask
-    # (country_fraction); default OFF so existing runs are unchanged.
-    if str(config.get("NationalPriorDomainInvariant", False)).strip().lower() not in ("true", "1", "yes"):
+    # DOMAIN-INVARIANT national term: scale each country's national rank-1 by 1/f_C^2 so a partially-in-
+    # domain country is not pinned to its whole-country total. Needs the shapefile mask (country_fraction);
+    # defaults ON for regional inversions (a no-op where f_C=1), OFF for global.
+    if not domain_invariant_enabled(config):
         country_fraction = None
     elif country_fraction is not None:
         print(f"Domain-invariant national term ON: f_C for {len(country_fraction)} countries "

@@ -54,19 +54,19 @@ USA,Gas,0.25
 
 In a regional inversion (e.g. Nigeria) some countries lie only partly inside the domain. The reported
 BTR uncertainty is for the **whole** country, so pinning only the in-domain part to that whole-country
-total over-constrains it. Turn on the domain-invariant national term to correct this:
+total would over-constrain it. The builder corrects this automatically: it scales each country's
+national (rank-1) covariance by `1/f_C^2`, where `f_C` is the fraction of the country's area inside the
+domain (one equal-area polygon clip per country — cheap). A country fully inside the domain has
+`f_C = 1` (no change); a sliver gets a very large national variance, i.e. its in-domain emissions are
+effectively not pinned to the national total, which is correct.
 
-```yaml
-NationalPriorDomainInvariant: true
-```
+This is **on by default for regional inversions** (`isRegional: true`) and a no-op for global ones. Set
+`NationalPriorDomainInvariant: false` to disable it (a `NOTE` is then printed if a matched country
+extends beyond the domain).
 
-This scales each country's national (rank-1) covariance by `1/f_C^2`, where `f_C` is the fraction of
-the country's area inside the domain (computed in an equal-area projection). A country fully inside the
-domain has `f_C = 1` (unchanged); a sliver has a very large national variance (i.e. its in-domain
-emissions are effectively not pinned to the national total, which is correct). `f_C` is an **area**
-fraction — a first-order stand-in for the in-domain **emission** fraction, which cannot be known from
-in-domain inputs alone. When this option is **off** and a matched country extends beyond the domain,
-the builder prints a `NOTE` recommending you enable it.
+`f_C` is an **area** fraction. It equals the in-domain **emission** fraction the correction really wants
+only under a uniform-emission-density assumption — the best estimate available, since a regional run
+has no out-of-domain emissions with which to compute the true emission fraction.
 
 ## Advanced options
 
