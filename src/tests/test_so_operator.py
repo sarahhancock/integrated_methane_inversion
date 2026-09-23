@@ -130,3 +130,36 @@ def test_two_exponential_nonadjacent_days_decouple():
     Sinv = np.linalg.inv(So)
     KTinvSoK, _, _ = compute_so_normal_equations(K, dy, so, lat, lon, dates, params)
     assert np.allclose(KTinvSoK, K.T @ Sinv @ K, atol=1e-8)
+
+
+def test_first_order_exponential_correction_matches_neumann():
+    # The non-two_exponential forms use the first-order (Woodbury) inverse So^-1 ~ D^-2 - D^-1 P D^-1,
+    # so KTinvSoK = K^T diag(1/so) K - W^T P W with W = K/sqrt(so), P_ij = A exp(-d/L) for d <= cutoff.
+    # Weak amplitude + tight cluster keeps I-P positive definite so the correction is actually applied.
+    n = 12
+    day_index = np.zeros(n, dtype=int)
+    lat, lon, _, _, K, dy, so = _obs_cluster(41, n, day_index)   # ~ +/- 220 km cluster, all within cutoff
+    params = {"form": "exponential", "corr_amplitude": 0.05, "corr_length_km": 150.0, "corr_cutoff_km": 1500.0}
+    KTinvSoK, KTinvSoy, ytinvSoy = compute_so_normal_equations(K, dy, so, lat, lon, None, params)
+
+    # dense P built exactly as build_sparse_so_correction does (haversine <= cutoff, rho stored float32)
+    P = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            d = _great_circle_km(lat[i], lon[i], lat[j], lon[j])
+            if d <= 1500.0:
+                P[i, j] = np.float32(0.05 * np.exp(-d / 150.0))
+    inv = 1.0 / so
+    isq = 1.0 / np.sqrt(so)
+    W = K * isq[:, None]
+    wdy = dy * isq
+    ref_KTinvSoK = K.T @ (K * inv[:, None]) - W.T @ (P @ W)
+    ref_KTinvSoy = K.T @ (dy * inv) - W.T @ (P @ wdy)
+    ref_ytinvSoy = float(dy @ (dy * inv) - wdy @ (P @ wdy))
+    # the correction must actually be applied (result differs from the plain diagonal)
+    assert not np.allclose(KTinvSoK, K.T @ (K * inv[:, None]))
+    assert np.allclose(KTinvSoK, ref_KTinvSoK, atol=1e-5)
+    assert np.allclose(KTinvSoy, ref_KTinvSoy, atol=1e-5)
+    assert np.isclose(ytinvSoy, ref_ytinvSoy, atol=1e-5)
