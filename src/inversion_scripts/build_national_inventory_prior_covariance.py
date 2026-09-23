@@ -555,7 +555,10 @@ def two_component_absolute(
         # national aggregate therefore rises to max(u, g) and the grid-scale structure is always preserved.
         g_floor2 = max(g * g - u * u, 0.0)                     # (g^2 - u^2) where u < g, else 0
         if g_floor2 > 0.0:
-            Sa_abs[np.ix_(positions, positions)] += g_floor2 * np.outer(emis, emis)   # within-country systematic floor -> aggregate = g
+            # The Saunois floor is a within-country rank-1 like the NATIONAL term, so it must carry the
+            # SAME domain-invariance scaling 1/f_C^2 -- otherwise a partially-in-domain country whose
+            # u_BTR < g would not get its whole-country aggregate raised to g.
+            Sa_abs[np.ix_(positions, positions)] += (g_floor2 / (fC * fC)) * np.outer(emis, emis)   # within-country systematic floor -> whole-country aggregate = g
         # national aggregate^2 = NATIONAL snat^2 E_c^2 + LOCAL snat^2 sum(r2 E^2) + FLOOR g_floor2 E_c^2
         #                      = (u^2 + max(g^2 - u^2, 0)) E_c^2 = max(u, g)^2 E_c^2
         achieved = np.sqrt((snat * snat) * (total * total + float(np.sum(r2 * emis ** 2)))
@@ -691,7 +694,7 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
     # defaults ON for regional inversions (a no-op where f_C=1), OFF for global.
     if not domain_invariant_enabled(config):
         country_fraction = None
-    elif country_fraction is not None:
+    elif country_fraction:                                    # non-empty: at least one country matched
         print(f"Domain-invariant national term ON: f_C for {len(country_fraction)} countries "
               f"(min {min(country_fraction.values()):.2f}, max {max(country_fraction.values()):.2f}); "
               f"national var scaled by 1/f_C^2.")

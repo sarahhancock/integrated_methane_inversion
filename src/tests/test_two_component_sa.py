@@ -127,3 +127,15 @@ def test_domain_invariance_scales_national_offdiagonal():
     Sa_full, _ = two_component_absolute(rows, {}, {}, urows, 2, grid_national_ratio=2.5, country_fraction={"1": 1.0})
     Sa_half, _ = two_component_absolute(rows, {}, {}, urows, 2, grid_national_ratio=2.5, country_fraction={"1": 0.5})
     assert np.isclose(Sa_half[0, 1] / Sa_full[0, 1], 1.0 / 0.5 ** 2, atol=1e-9)
+
+
+def test_domain_invariance_scales_saunois_floor_rank1_too():
+    # With the Saunois floor engaged (u_BTR < g), the off-diagonal is the national rank-1 PLUS the floor
+    # rank-1; BOTH must carry the domain-invariant 1/f_C^2 scaling, so a partially-in-domain country whose
+    # BTR uncertainty is below the Saunois background still reaches g at the whole-country scale.
+    rows = {("1", "Landfills", 0): 2.0, ("1", "Landfills", 1): 1.0}
+    urows = [{"country_id": "1", "sector": "Landfills", "relative_uncertainty": 0.05}]  # u < g so the floor engages
+    kw = dict(grid_national_ratio=2.5, min_uncertainty=0.0, global_background={"Landfills": 0.19})
+    Sa_full, _ = two_component_absolute(rows, {}, {}, urows, 2, country_fraction={"1": 1.0}, **kw)
+    Sa_half, _ = two_component_absolute(rows, {}, {}, urows, 2, country_fraction={"1": 0.5}, **kw)
+    assert np.isclose(Sa_half[0, 1] / Sa_full[0, 1], 1.0 / 0.5 ** 2, atol=1e-9)

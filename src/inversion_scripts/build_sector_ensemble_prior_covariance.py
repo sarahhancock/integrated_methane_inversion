@@ -225,7 +225,7 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
     # national total. Needs the shapefile mask; unchanged for fully-in-domain countries (f_C=1).
     if not domain_invariant_enabled(config):
         country_fraction = None
-    elif country_fraction is not None:
+    elif country_fraction:                                    # non-empty: at least one country matched
         print(f"Domain-invariant national term ON: f_C for {len(country_fraction)} countries "
               f"(min {min(country_fraction.values()):.2f}, max {max(country_fraction.values()):.2f}).")
 

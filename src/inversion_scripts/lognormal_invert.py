@@ -227,7 +227,7 @@ def lognormal_invert(config, state_vector_filepath, jacobian_sf):
             print(f"  UseResidualObsError set but {rem_path} not found; using parametric super-ob So.")
     obs_lat = obs_lon = obs_dates = None
     so_corr_params = None
-    if str(config.get("OffDiagonalObsCov", False)).strip().lower() in ("true", "1", "yes"):
+    if str(config.get("OffDiagonalObsCov", True)).strip().lower() in ("true", "1", "yes"):   # default ON, matching invert.py
         obs_lat, obs_lon, obs_dates = _load_obs_metadata(inversion_data, start_str, end_str)
         if obs_lat is not None:
             L2 = float(config.get("OffDiagonalObsCovL2", 398.0))
@@ -307,8 +307,11 @@ def lognormal_invert(config, state_vector_filepath, jacobian_sf):
 
         if optimize_oh:
             oh_errors = sa_oh**2 * np.ones((OH_element_num, 1))
-            # weight the OH term(s) following Maasakkers et al. (2019)
-            oh_weight = OH_element_num / (num_normal_elems - OH_element_num)
+            # Weight the OH term(s) following Maasakkers et al. (2019). The denominator is the FULL state
+            # vector minus the OH elements (n ROI + buffer + BC), matching apply_oh_prior in invert.py for
+            # the normal/softplus solvers -- NOT (num_normal_elems - OH), which drops the n ROI elements
+            # and would leave OH almost unconstrained relative to the other solvers.
+            oh_weight = OH_element_num / (n + num_normal_elems - OH_element_num)
             oh_errors_constraint = (oh_weight * sa_oh**2) * np.ones((OH_element_num, 1))
             sa_normal = np.concatenate(
                 (base_sa_normal, oh_errors), axis=0
