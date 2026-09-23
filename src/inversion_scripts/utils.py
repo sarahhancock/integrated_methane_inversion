@@ -1491,6 +1491,37 @@ def build_reference_index(ref_dir: str | Path) -> dict[int, Path]:
     return index
 
 
+def align_obs_rows_with_reference(obs_GC, obs_GC_ref):
+    """Match target observations to reference rows using shared metadata columns (lat, lon, obs_count).
+
+    Returns (obs_indices, ref_indices): row i of the target keeps only if it has a matching reference
+    row, and ref_indices[k] is the reference row that target row obs_indices[k] maps to. Used by the
+    precomputed-Jacobian path (invert.py day-level and merge_partial_k) so each retained observation is
+    paired with the same scene in the reference run, which can differ in observation count/order.
+    """
+    from collections import defaultdict, deque
+
+    ncols = min(obs_GC.shape[1], obs_GC_ref.shape[1])
+
+    def make_key(row):
+        # Ignore the leading observed/model xCH4 columns and match on shared metadata.
+        return tuple(np.round(row[2:ncols], decimals=6))
+
+    ref_lookup = defaultdict(deque)
+    for idx, row in enumerate(obs_GC_ref):
+        ref_lookup[make_key(row)].append(idx)
+
+    obs_indices = []
+    ref_indices = []
+    for idx, row in enumerate(obs_GC):
+        key = make_key(row)
+        if ref_lookup[key]:
+            obs_indices.append(idx)
+            ref_indices.append(ref_lookup[key].popleft())
+
+    return np.asarray(obs_indices, dtype=int), np.asarray(ref_indices, dtype=int)
+
+
 def map_files_to_reference(
     target_dir: str | Path, ref_dir: str | Path
 ) -> dict[Path, Path]:

@@ -9,6 +9,7 @@ from src.inversion_scripts.utils import (
     calculate_superobservation_error,
     ensure_float_list,
     map_files_to_reference,
+    align_obs_rows_with_reference,
 )
 from src.utilities.config_utils import load_config
 
@@ -107,7 +108,28 @@ def merge_partial_k(satdat_dir, lat_bounds, lon_bounds, obs_errs, precomp_K, all
             continue
         obs_GC = obs_GC[ind[0], :]  # satellite and GEOS-Chem data within bounds
 
-        # concatenate full jacobian, obs, so, and prior
+        # Determine the Jacobian rows for this file. For a precomputed Jacobian, K comes from a
+        # reference run whose observations can differ in count/order, so ALIGN this file's (bounds-
+        # filtered) observations to the reference and keep only matched rows -- indexing the reference
+        # K by the current file's positions would otherwise misalign each row's Jacobian. Every per-
+        # observation product below is then built from the same aligned obs_GC.
+        if precomp_K:
+            # Get Jacobian from reference inversion
+            fi_ref = K_ref_file_mappings.get(Path(pth))   # may be None (str() would hide it -> "None")
+            if fi_ref is None:
+                print(f"No reference file found for {pth}. Skipping this file.")
+                continue
+            dat_ref = load_obj(str(fi_ref))
+            obs_ind, ref_ind = align_obs_rows_with_reference(obs_GC, dat_ref["obs_GC"])
+            if len(ref_ind) == 0:
+                print(f"No overlapping reference observations for {pth}. Skipping this file.")
+                continue
+            obs_GC = obs_GC[obs_ind, :]
+            K_temp = np.asarray(dat_ref["K"][ref_ind], dtype=np.float32)
+        else:
+            K_temp = np.asarray(obj["K"][ind[0]], dtype=np.float32) if "K" in obj else None
+
+        # concatenate full jacobian, obs, so, and prior (all from the aligned obs_GC)
         satellite_list[i] = np.asarray(obs_GC[:, 0], dtype=np.float32)
         geos_prior_list[i] = np.asarray(obs_GC[:, 1], dtype=np.float32)
         lon_list[i] = np.asarray(obs_GC[:, 2], dtype=np.float32)
@@ -122,21 +144,9 @@ def merge_partial_k(satdat_dir, lat_bounds, lon_bounds, obs_errs, precomp_K, all
             date_val = "00000000"
         dates_list[i] = np.repeat(date_val, obs_GC.shape[0])
 
-        # read K from reference dir if precomp_K is true
-        if precomp_K:
-            # Get Jacobian from reference inversion
-            fi_ref = K_ref_file_mappings.get(Path(pth))   # may be None (str() would hide it -> "None")
-            if fi_ref is None:
-                print(f"No reference file found for {pth}. Skipping this file.")
-                continue
-            dat_ref = load_obj(str(fi_ref))
-            K_temp = dat_ref["K"][ind[0]]
-        else:
-            K_temp = obj["K"][ind[0]] if "K" in obj else None
-        
         # add K_temp to K_list
         if K_temp is not None:
-            K_list[i] = np.asarray(K_temp, dtype=np.float32)
+            K_list[i] = K_temp
 
         for obs_err in obs_errs:
             key = f"so_{obs_err}"

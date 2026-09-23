@@ -21,6 +21,7 @@ from src.inversion_scripts.utils import (
     get_mean_emissions,
     update_prior_error_for_OptimizeSoil,
     map_files_to_reference,
+    align_obs_rows_with_reference,
 )
 from src.inversion_scripts.softplus_invert import (
     run_softplus,
@@ -48,28 +49,6 @@ def resolve_inversion_method(config):
         method = "softplus"
     return method
 
-
-def align_obs_rows_with_reference(obs_GC, obs_GC_ref):
-    """Match target observations to reference rows using shared metadata columns (lat, lon, obs_count)."""
-    ncols = min(obs_GC.shape[1], obs_GC_ref.shape[1])
-
-    def make_key(row):
-        # Ignore the leading observed/model xCH4 columns and match on shared metadata.
-        return tuple(np.round(row[2:ncols], decimals=6))
-
-    ref_lookup = defaultdict(deque)
-    for idx, row in enumerate(obs_GC_ref):
-        ref_lookup[make_key(row)].append(idx)
-
-    obs_indices = []
-    ref_indices = []
-    for idx, row in enumerate(obs_GC):
-        key = make_key(row)
-        if ref_lookup[key]:
-            obs_indices.append(idx)
-            ref_indices.append(ref_lookup[key].popleft())
-
-    return np.asarray(obs_indices, dtype=int), np.asarray(ref_indices, dtype=int)
 
 def get_prior_sigma_vector(
     n_elements,
@@ -560,6 +539,25 @@ def scale_merged_k_by_gridded_sf(K, scalers):
         return K
     K[:, : scalers.size] *= scalers
     return K
+
+
+def apply_precomputed_sf_to_merged_k(K, scale_factors):
+    """Apply precomputed per-element Jacobian scale factors to a merged Jacobian.
+
+    merge_partial_k stores the RAW reference Jacobian when PrecomputedJacobian=true, so this applies
+    the scale factors a SINGLE time. Only the leading emission/buffer columns are scaled (scale_factors
+    covers them, in state-vector order); the trailing boundary-condition and OH columns are left
+    unscaled, matching the day-level precomputed path.
+    """
+    scale_factors = np.asarray(scale_factors, dtype=float).ravel()
+    if scale_factors.size > K.shape[1]:
+        raise ValueError(
+            f"jacobian scale factors have {scale_factors.size} entries but merged K has only "
+            f"{K.shape[1]} columns."
+        )
+    sf_full = np.ones(K.shape[1], dtype=float)
+    sf_full[: scale_factors.size] = scale_factors
+    return np.asarray(K, dtype=float) * sf_full[None, :]
 
 
 def load_merged_jacobian_products(config, StateVectorFile=None):
@@ -1349,8 +1347,19 @@ if __name__ == "__main__":
     use_offdiag_so = bool(config.get("OffDiagonalObsCov", True))  # default ON (matches config.yml + run_inversion.sh)
 
     merged_products = load_merged_jacobian_products(config, StateVectorFile)
-    if merged_products is not None and jacobian_sf is None:
+    if merged_products is not None:
         K, y, prior, so_dict, obs_lat, obs_lon, obs_dates = merged_products
+        if jacobian_sf is not None:
+            # PrecomputedJacobian: merge_partial_k stored the RAW reference Jacobian (merge_partial_k
+            # reads dat_ref["K"] unscaled), so apply the per-element scale factors here -- a SINGLE
+            # scaling, no double-count. This scales the leading emission/buffer columns; the trailing
+            # BC and OH columns are left unscaled, matching the day-level precomputed path. Running the
+            # merged path (rather than raising) lets a precomputed-Jacobian re-run use the off-diagonal
+            # So and the softplus/lognormal solvers.
+            scale_factors = np.load(jacobian_sf)
+            K = apply_precomputed_sf_to_merged_k(K, scale_factors)
+            print(f"PrecomputedJacobian: scaled {np.asarray(scale_factors).size} emission/buffer columns "
+                  f"of merged K by {jacobian_sf} (BC/OH columns left unscaled).")
         scale_factor_upper_bound = None
         if max_true_scale_factor not in (None, "", "None", False):
             sf_path = config.get(
@@ -1416,28 +1425,23 @@ if __name__ == "__main__":
             softplus_scale=softplus_scale,
         )
     else:
-        # Day-level streaming path: reads observations day by day and accumulates
-        # K^T So^-1 K without holding all observations at once, for state vectors too
-        # large for the merged path.  It solves the standard analytical (normal)
-        # inversion only; the softplus positivity solver and off-diagonal So need the
-        # merged path (they operate on the full assembled system).
-        # NOTE: PrecomputedJacobian=true sets jacobian_sf (non-None), which routes execution here
-        # (the merged path above requires jacobian_sf is None), so a precomputed-Jacobian re-run with
-        # the default OffDiagonalObsCov/softplus lands on these guards.
+        # Day-level streaming fallback: reached only when NO merged monthly products were found for this
+        # period. Reads observations day by day and accumulates K^T So^-1 K without holding them all at
+        # once. It solves the standard analytical (normal) inversion only; the softplus/lognormal solvers
+        # and the off-diagonal So need the merged products (they operate on the full assembled system).
         if use_offdiag_so:
             raise RuntimeError(
-                "OffDiagonalObsCov=true requires the merged monthly inversion products with "
-                "observation latitude/longitude metadata; the day-level pickle fallback path cannot "
-                "apply residual-correlation So. This path is taken when PrecomputedJacobian=true "
-                "(jacobian_sf is set). For a precomputed-Jacobian re-run, set OffDiagonalObsCov: false, "
-                "or run the full (non-precomputed) merged path."
+                "OffDiagonalObsCov=true requires the merged monthly inversion products (K/y/So with "
+                "per-observation lat/lon/dates); none were found for this period, so the day-level "
+                "pickle fallback cannot apply the residual-correlation So. Build the merged products "
+                "(merge_partial_k) or set OffDiagonalObsCov: false."
             )
         if str(inversion_method).lower() not in ("analytical", "normal", "gaussian"):
             raise RuntimeError(
-                f"InversionMethod={inversion_method} requires the merged monthly inversion path; the "
-                "day-level streaming path supports only the analytical (normal) inversion. This path is "
-                "taken when PrecomputedJacobian=true (jacobian_sf is set). Set InversionMethod/solver to "
-                "normal for a precomputed-Jacobian re-run, or use the full merged path for softplus/lognormal."
+                f"InversionMethod={inversion_method} requires the merged monthly inversion products; "
+                "none were found for this period. The day-level streaming fallback supports only the "
+                "analytical (normal) inversion. Build the merged products (merge_partial_k) or set the "
+                "solver to normal."
             )
         gc_startdate = np.datetime64(datetime.datetime.strptime(str(config['StartDate']), "%Y%m%d"))
         gc_enddate = np.datetime64(datetime.datetime.strptime(str(config['EndDate']), "%Y%m%d"))
