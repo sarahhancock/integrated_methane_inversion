@@ -13,7 +13,7 @@ standard (unit-diagonal correlation, per-element sigma) contract:
      diag(sigma_i E_i) exp(-d_ij / L) diag(sigma_j E_j), with a per-cell relative error
      sigma_i (inter-model spread) mapped onto the state-vector elements and a correlation
      length L fit from the ensemble variogram.  Enabled by SectorEnsembleWetlandFile.
-  3. Remaining natural sectors + OtherAnth -> a generic correlated block
+  3. Remaining natural sectors -> a generic correlated block
      diag(sigma E) [exp(-d/L) o S] diag(sigma E) with sigma=0.5 and S the cosine similarity of the
      cells' sectoral composition, at L = the wetland ensemble length (fallback 200 km, Yu et al. 2021).
      Each sector also gets a domain-wide Saunois systematic g_s^2 outer(e_s, e_s) so its continental
@@ -87,7 +87,7 @@ except ModuleNotFoundError:
 # two-component national covariance. Others present in the prior are handled by the wetland
 # ensemble (Wetlands) or the generic block (everything else). Overridable via config.
 DEFAULT_TWO_COMPONENT_SECTORS = [
-    "Livestock", "Rice", "Landfills", "Wastewater", "Coal", "Gas", "Oil",
+    "Livestock", "Rice", "Landfills", "Wastewater", "Coal", "Gas", "Oil", "OtherAnth",
 ]
 EARTH_RADIUS_KM = 6371.0
 
@@ -302,10 +302,22 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
     elif "Wetlands" in sector_emis:
         print("SectorEnsembleWetlandFile not set; Wetlands folded into the generic correlated block.")
 
-    # ---- (3) generic correlated block for remaining sectors (naturals + OtherAnth) ----
+    # ---- (3) generic correlated block for remaining sectors (naturals) ----
+    # A sector listed as two-component but with no reported (BTR) uncertainty is not pinned by
+    # block (1), so fall it back to the generic block here rather than leave it unconstrained.
+    two_component_covered = {r["sector"] for r in anthro_rows}
+    fallback_to_generic = [
+        s for s in two_component_sectors
+        if s not in two_component_covered and s in sector_emis
+    ]
+    if fallback_to_generic:
+        print(f"WARNING: sector(s) {fallback_to_generic} were requested for the two-component (BTR) prior "
+              f"via SectorEnsembleTwoComponentSectors but have no reported national uncertainty in "
+              f"NationalPriorUncertaintyFile; they fall back to the generic correlated block. Add rows for "
+              f"them to NationalPriorUncertaintyFile to give them the BTR two-component covariance instead.")
     generic_default = [
         s for s in sector_names
-        if s not in two_component_sectors and not (s == "Wetlands" and wetland_handled)
+        if s not in two_component_covered and not (s == "Wetlands" and wetland_handled)
     ]
     generic_sectors = list(config.get("SectorEnsembleGenericSectors", generic_default))
     generic_sectors = [s for s in generic_sectors if s in sector_emis]
