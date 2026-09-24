@@ -129,7 +129,12 @@ ShapeFile: "/home/ubuntu/integrated_methane_inversion/resources/shapefiles/Permi
 ## - PriorErrorOH is a relative fraction (e.g. 0.1 = 10%)
 ## - PriorErrorBCs is in ppb
 ## - PriorErrorBufferElements is only used if LognormalErrors is true
+## - SoftplusErrors selects the softplus positivity solver (analytical path): a smooth transform that
+##   keeps every emission scale factor strictly positive, solved by Levenberg-Marquardt. It is an
+##   alternative to LognormalErrors; SoftplusScale sets the transform smoothing scale (0.1 is near-ReLU).
 LognormalErrors: false
+SoftplusErrors: false
+SoftplusScale: 0.1
 PriorError: [0.5]
 PriorErrorBCs: [10.0]
 PriorErrorBufferElements: [0.5]
