@@ -35,8 +35,11 @@ def build_lognormal_prior_cov(config, sa, n):
     mu = -sigma_ln^2 / 2 keeps E[SF] = 1).
 
     Returns (lnSa_ROI (n, n), prior_scale (n,)). When no prebuilt BTR covariance is present it
-    falls back to the uniform geometric-factor prior (sigma_ln = ln(sa), lnSa = (ln sa)^2 I),
-    reproducing the previous behaviour.
+    falls back to a uniform diagonal prior built from PriorError as a relative uncertainty u, converted
+    the SAME way (Sigma_ln = ln(1 + u^2) I). So PriorError means the same thing -- a relative (arithmetic,
+    coefficient-of-variation) uncertainty -- in both paths and matches the normal inversion, instead of
+    being reinterpreted as a geometric factor (GSD). (Previously the fallback used lnSa = (ln sa)^2 I,
+    i.e. sa treated as a GSD, so e.g. PriorError=0.5 gave GSD 2 -- a factor-of-2 spread, not a 50% error.)
     """
     use_btr = str(config.get("OffDiagonalPriorCov", False)).strip().lower() in ("true", "1", "yes")
     if use_btr and os.path.exists("prior_norm_error_covariance.npz"):
@@ -62,8 +65,7 @@ def build_lognormal_prior_cov(config, sa, n):
             f"(n={n}, median sigma_ln={float(np.median(np.sqrt(np.diag(lnSa)))):.3f})"
         )
     else:
-        lnsa_val = float(np.log(float(sa)))                             # geometric-factor fallback
-        lnSa = (lnsa_val ** 2) * np.eye(n)
+        lnSa = np.log1p(float(sa) ** 2) * np.eye(n)                     # moment-match: Sigma_ln = ln(1 + u^2) I, u=PriorError (relative uncertainty), same convention as the BTR path above
     prior_scale = np.exp(-0.5 * np.diag(lnSa))                          # per-element mean->median shift
     return lnSa, prior_scale
 

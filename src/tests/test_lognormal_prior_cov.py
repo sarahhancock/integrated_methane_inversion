@@ -22,10 +22,14 @@ def _write_prior_npz(path, C, sigma_scale):
 
 def test_fallback_without_npz(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    # No OffDiagonalPriorCov / no prebuilt npz -> geometric-factor fallback lnSa = (ln sa)^2 I.
-    lnSa, prior_scale = build_lognormal_prior_cov({}, 2.0, 4)
-    assert np.allclose(lnSa, (np.log(2.0) ** 2) * np.eye(4))
+    # No OffDiagonalPriorCov / no prebuilt npz -> uniform moment-matched fallback: PriorError is a relative
+    # uncertainty u, converted like the BTR path via Sigma_ln = ln(1 + u^2) I (NOT sa-as-GSD).
+    u = 0.5
+    lnSa, prior_scale = build_lognormal_prior_cov({}, u, 4)
+    assert np.allclose(lnSa, np.log1p(u ** 2) * np.eye(4))
     assert np.allclose(prior_scale, np.exp(-0.5 * np.diag(lnSa)))
+    # exact CV round-trip: Var[e^z] = e^{s2} - 1 = u^2 with mu = -s2/2 (E[SF] = 1), same as the BTR path
+    assert np.isclose(np.exp(lnSa[0, 0]) - 1.0, u ** 2, atol=1e-12)
 
 
 def test_diagonal_btr_cv_roundtrip(tmp_path, monkeypatch):
