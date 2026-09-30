@@ -95,6 +95,49 @@ def sum_total_emissions(emissions, areas, mask):
     return float(total)
 
 
+def reduced_sectoral_averaging_kernel(avkern, sector_ds, areas, mask, species="CH4"):
+    """
+    Emission-weighted mean averaging-kernel sensitivity per emission sector.
+
+    With one scale factor per grid cell, individual emission sectors are NOT
+    separately resolved by the inversion -- a cell's averaging-kernel diagonal
+    applies to its TOTAL flux. This diagnostic weights each cell's averaging-kernel
+    sensitivity by that sector's emission there, giving the emission-weighted MEAN
+    sensitivity over the sector's footprint (in [0, 1]):
+
+        AK_sector = sum_i (E_{s,i} * area_i * A_i) / sum_i (E_{s,i} * area_i)
+
+    It summarises how well-observed a sector's emissions are. It is NOT a
+    degrees-of-freedom-for-signal and must not be summed across sectors as a DOFS
+    (the sectors are not independent state-vector elements).
+
+    Arguments:
+        avkern    : xarray data array of gridded averaging-kernel sensitivities
+                    (diagonal of A over the ROI, e.g. gridded_posterior["A"])
+        sector_ds : xarray dataset with per-sector emission fields named
+                    Emis{species}_<sector> (e.g. the prior emission dataset)
+        areas     : xarray data array of grid-cell areas
+        mask      : xarray data array binary mask for the region of interest
+        species   : emitted species in the field names (default "CH4")
+
+    Returns:
+        pandas.Series {sector: emission-weighted mean sensitivity}, sorted descending
+    """
+    ak = avkern
+    if "ensemble" in getattr(ak, "dims", ()):      # use the base (mean) member
+        ak = ak.isel(ensemble=0)
+    out = {}
+    for var in sector_ds.data_vars:
+        if f"Emis{species}" not in var or any(t in var for t in ("Total", "Excl", "Soil")):
+            continue
+        # absolute sector emission per cell, restricted to cells with a defined AK
+        weight = (sector_ds[var] * areas * mask).where(np.isfinite(ak))
+        denom = float(weight.sum())
+        if denom > 0:
+            out[var.replace(f"Emis{species}_", "")] = float((weight * ak).sum()) / denom
+    return pd.Series(out).sort_values(ascending=False)
+
+
 def filter_obs_with_mask(mask, df, UseGCHP=False):
     """
     Select observations lying within a boolean mask
