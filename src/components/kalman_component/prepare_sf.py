@@ -30,7 +30,7 @@ def prepare_sf(config_path, period_number, base_directory, nudge_factor, species
     # emissions-only (EmisCH4_Total_ExclSoilAbs). In the net basis a net-negative flux is a physical
     # sink, so we do NOT clip negative posterior emissions -- the nudge factor tempers swings instead.
     # Both config-guarded (defaults preserve the original emissions-only + clip behavior).
-    optimize_soil = bool(config.get("OptimizeSoilSink", False))
+    optimize_soil = bool(config.get("OptimizeSoil", False))
     clip_negative_emis = bool(config.get("ClipNegativePosteriorEmis", not optimize_soil))
     ch4_emis_key = "EmisCH4_Total" if optimize_soil else "EmisCH4_Total_ExclSoilAbs"
 
