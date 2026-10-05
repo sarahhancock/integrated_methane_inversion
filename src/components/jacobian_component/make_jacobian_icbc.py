@@ -64,7 +64,7 @@ def make_jacobian_icbc(config, original_file_path, new_file_path, file_date, spe
     new_restart[key] *= 0.0
     new_restart[key] += 1/mixing_ratio_conv_factor(species)
 
-    if config['UseGCHP']:
+    if config.get("UseGCHP", False):
         write_path = os.path.join(new_file_path, f"{file_prefix}{file_date}_0000z.c{config['CS_RES']}.nc4")
     else:
         write_path = os.path.join(new_file_path, f"{file_prefix}{file_date}_0000z.nc4")
@@ -80,7 +80,7 @@ if __name__ == "__main__":
     file_date = sys.argv[4]
     species = sys.argv[5]
 
-    config = load_config(config_path)
+    config = load_config(config_path, validate_hierarchy=False)
 
     # default to getting the first file in the directory
     # or the file itself if it is a file

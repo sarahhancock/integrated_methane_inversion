@@ -16,17 +16,20 @@
 #   submit_job <SchedulerType> <output_bool> <Memory> <CPUs> <Time> <Partition> <Script> <AdditionalArguments>
 submit_job() {
     if [[ $1 = "slurm" || $1 = "tmux" ]]; then
-        submit_slurm_job "${@:2}"
+        submit_slurm_job "${@:2}" || return $?
     elif [[ $1 = "PBS" ]]; then
-        submit_pbs_job "${@:2}"
+        submit_pbs_job "${@:2}" || return $?
     else
         echo "Scheduler type $1 not recognized."
+        return 1
     fi
 
     # If output was saved, concatenate it to imi_output
     if [[ $2 = "true" ]]; then
-        cat imi_output.tmp >> ${InversionPath}/imi_output.log
-        rm imi_output.tmp
+        if [[ -f imi_output.tmp ]]; then
+            cat imi_output.tmp >> ${InversionPath}/imi_output.log
+            rm imi_output.tmp
+        fi
     fi
 }
 
@@ -473,9 +476,9 @@ get_run_duration() {
   local m2=$(date -d "$end_date" +%m)
   local d2=$(date -d "$end_date" +%d)
 
-  local years=$((y2 - y1))
-  local months=$((m2 - m1))
-  local days=$((d2 - d1))
+  local years=$((10#$y2 - 10#$y1))
+  local months=$((10#$m2 - 10#$m1))
+  local days=$((10#$d2 - 10#$d1))
 
   # Adjust negative days
   if (( days < 0 )); then

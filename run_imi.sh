@@ -3,7 +3,7 @@
 #SBATCH -N 1
 #SBATCH -c 1
 #SBATCH --mem=2000
-#SBATCH --mail-type=END
+#SBATCH --mail-type=NONE
 #SBATCH -o "imi_output.log"
 
 ## Uncomment to use PBS
@@ -50,23 +50,42 @@ else
     ConfigFile="config.yml"
 fi
 
-# Get the conda environment name and source file
-# These variables are sourced manually because
-# we need the python environment to parse the yaml file
-PythonEnv=$(grep '^PythonEnv:' ${ConfigFile} |
+# Get the python/conda environment settings before parsing the full yaml.
+PythonEnv=$({ grep '^PythonEnv:' ${ConfigFile} || true; } |
     sed 's/PythonEnv://' |
+    sed 's/#.*//' |
+    sed 's/^[[:space:]]*//' |
+    tr -d "\"'")   # strip BOTH " and ': monthly_config.py serializes empty "" as '' (single-quoted); '' must read as empty
+CondaFile=$(eval echo $({ grep '^CondaFile:' ${ConfigFile} || true; } |
+    sed 's/CondaFile://' |
+    sed 's/#.*//' |
+    sed 's/^[[:space:]]*//' |
+    tr -d '"'))
+CondaEnv=$({ grep '^CondaEnv:' ${ConfigFile} || true; } |
+    sed 's/CondaEnv://' |
     sed 's/#.*//' |
     sed 's/^[[:space:]]*//' |
     tr -d '"')
 
 # Load conda/mamba/micromamba and append the current directory to PYTHONPATH
-source $PythonEnv
-export PYTHONPATH=${PYTHONPATH}:$(pwd -P)
+set +u
+if [[ -n "$PythonEnv" ]]; then
+    source "$PythonEnv"
+else
+    source "$CondaFile"
+    conda activate "$CondaEnv"
+fi
+export PYTHONPATH="${PYTHONPATH:-}:$(pwd -P)"
 
 # Parsing the config file
-eval $(python src/utilities/parse_yaml.py ${ConfigFile})
+parsed_config=$(python src/utilities/parse_yaml.py ${ConfigFile}) || exit 1
+eval "$parsed_config"
 
-if [[ -z "$GEOSChemEnv" ]]; then
+if [[ -z "${DataPathObs:-}" && -n "${DataPathTROPOMI:-}" ]]; then
+    DataPathObs="$DataPathTROPOMI"
+fi
+
+if [[ -z "${GEOSChemEnv:-}" ]]; then
     printf "\nWarning: GEOS-Chem environment not specified in config file.\n"
     printf "GEOS-Chem dependencies are assumed to be preloaded\n"
 else
@@ -77,7 +96,8 @@ else
         exit 1
     else
         printf "\nLoading GEOS-Chem environment: ${GEOSChemEnv}\n"
-            source ${GEOSChemEnv}
+        set +u
+        source ${GEOSChemEnv}
     fi
 
     # If scheduler is PBS, get the list of needed sites
@@ -136,7 +156,7 @@ InversionPath=$(pwd -P)
 ConfigPath=${InversionPath}/${ConfigFile}
 
 # add inversion path to python path
-export PYTHONPATH=${PYTHONPATH}:${InversionPath}
+export PYTHONPATH="${PYTHONPATH:-}:${InversionPath}"
 
 # Make run directory
 mkdir -p -v ${RunDirs}
@@ -158,22 +178,14 @@ echo "# GEOS-Chem version: ${GEOSCHEM_VERSION}" >>"${RunDirs}/config_${RunName}.
 echo "# TROPOMI/blended processor version(s): ${TROPOMI_PROCESSOR_VERSION}" >>"${RunDirs}/config_${RunName}.yml"
 
 ##=======================================================================
-##  Download the TROPOMI data
+##  Link the existing TROPOMI data
 ##=======================================================================
-# Download TROPOMI or blended dataset from AWS
 satelliteCache=${RunDirs}/satellite_data
 
 if [[ -z "$DataPathObs" ]]; then
-    mkdir -p -v $satelliteCache
-
-    if [[ "$SatelliteProduct" == "BlendedTROPOMI" ]]; then
-        downloadScript=src/utilities/download_blended_TROPOMI.py
-    elif [[ "$SatelliteProduct" == "TROPOMI" ]]; then
-        downloadScript=src/utilities/download_TROPOMI.py
-    else
-        printf "$SatelliteProduct is not currently supported for download"
-    fi
-    submit_job $SchedulerType true $RequestedMemory $RequestedCPUs $RequestedTime $downloadScript $StartDate $EndDate $satelliteCache
+    printf "\nDataPathObs is required for this South America workflow.\n"
+    printf "Set DataPathObs to the existing satellite archive; this setup should not download satellite data.\n"
+    exit 1
 else
     # use existing tropomi data and create a symlink to it
     if [[ ! -L $satelliteCache ]]; then
@@ -199,7 +211,7 @@ if "$DoSpinup"; then
     run_spinup
 fi
 
-if ("$DoOSSE" && "$EnableOSSE"); then
+if "$DoOSSE" && "$EnableOSSE"; then
     setup_osse
     run_osse
 fi
@@ -208,8 +220,12 @@ fi
 ##  Run Kalman Filter Mode
 ##=======================================================================
 if "$KalmanMode"; then
-    setup_kf
-    run_kf
+    if [[ "${ResumableMonthlyKalman:-false}" == "true" ]]; then
+        run_resumable_monthly_kf
+    else
+        setup_kf
+        run_kf
+    fi
 fi
 
 ##=======================================================================

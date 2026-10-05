@@ -311,11 +311,12 @@ def validate_config(cfg: Dict[str, Any]) -> Tuple[bool, List[str]]:
         if controller in cfg and _truthy_for_condition(cfg[controller]):
             required_keys.update(dependents)
 
-    # ObservationOnlyJacobianCache supplies the Jacobian directly as the merged
-    # K_{start}_{end}.npz cache (read by invert.py load_merged_jacobian_products),
-    # so a PrecomputedJacobian run does NOT need a ReferenceRunDir / data_converted
-    # reference in that mode.
-    if _truthy_for_condition(cfg.get("ObservationOnlyJacobianCache", False)):
+    # A cached-Jacobian mode supplies K directly (from the merged K_{start}_{end}.npz cache /
+    # CachedJacobianKDir, read by invert.py load_merged_jacobian_products or reused from production),
+    # so a PrecomputedJacobian run in any of these modes does NOT need a ReferenceRunDir /
+    # data_converted reference: ObservationOnlyJacobianCache, ReuseCachedJacobianK, LinearPriorReuseProd.
+    if any(_truthy_for_condition(cfg.get(k, False)) for k in
+           ("ObservationOnlyJacobianCache", "ReuseCachedJacobianK", "LinearPriorReuseProd")):
         required_keys.discard("ReferenceRunDir")
 
     # 3) Presence after conditionals

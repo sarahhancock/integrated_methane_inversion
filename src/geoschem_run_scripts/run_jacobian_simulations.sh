@@ -3,7 +3,7 @@
 
 is_valid_nc() {
     local file="$1"
-    local yyyymmdd="$2"
+    local min_time_len="$2"
 
     # Validate file structure
     if ! ncks -m "$file" > /dev/null 2>&1; then
@@ -17,7 +17,7 @@ is_valid_nc() {
         | sed -E 's/.*\(([0-9]+) currently\).*/\1/')
 
     # Check extraction worked and length matches
-    if [[ -z "$time_len" || "$time_len" != "24" ]]; then
+    if [[ -z "$time_len" || "$time_len" -lt "$min_time_len" ]]; then
         return 1
     fi
 
@@ -59,9 +59,14 @@ if {ReDoJacobian}; then
     # check if it is valid and has 24 entries of time
     yyyymmdd={EndDate}
     last_date=$(date -d "${yyyymmdd} -1 day" +%Y%m%d)
-    LastConcFile="GEOSChem.SpeciesConc.${last_date}_0000z.nc4"
+    LastOutputFile="GEOSChem.SpeciesConc.${last_date}_0000z.nc4"
+    MinTimeLen=24
+    if [[ -f "OutputDir/GEOSChem.SatDiagn.${last_date}_0000z.nc4" ]]; then
+        LastOutputFile="GEOSChem.SatDiagn.${last_date}_0000z.nc4"
+        MinTimeLen=1
+    fi
 
-    if is_valid_nc "OutputDir/$LastConcFile"; then
+    if is_valid_nc "OutputDir/$LastOutputFile" "$MinTimeLen"; then
         echo "Not re-running jacobian simulation: ${xstr}"
         exit 0
     else

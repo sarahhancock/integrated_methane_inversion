@@ -50,15 +50,21 @@ def source_gc_files(gc_source_path, day):
     # split file (hours 1-23) for the first day, with no separate hour-0 _0000z
     # snapshot. Treat the presence of either file as a valid "standard" source.
     species_split = species_standard.replace("_0000z.nc4", "_0005z.nc4")
+    pedge_split = pedge_standard.replace("_0000z.nc4", "_0005z.nc4")
     if (
         os.path.exists(species_standard)
         or os.path.exists(species_split)
         or not os.path.isdir(gc_source_path)
     ):
+        # Return whichever first-day file actually exists: a run that has no hour-0 snapshot
+        # (e.g. a fresh start from a spun-up/1ppb restart) writes only the _0005z split file,
+        # so returning the _0000z path unconditionally makes the downstream open() fail.
+        first_species = species_standard if os.path.exists(species_standard) else species_split
+        first_pedge = pedge_standard if os.path.exists(pedge_standard) else pedge_split
         return (
             "standard",
-            species_standard,
-            pedge_standard,
+            first_species,
+            first_pedge,
         )
 
     satdiagn_matches = sorted(

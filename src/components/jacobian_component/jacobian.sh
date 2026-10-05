@@ -416,7 +416,7 @@ create_simulation_dir() {
     HcoPrevLine3="#300N SCALE_ELEM_000N ${RunDirs}/StateVector.nc StateVector 2000/1/1/0 C xy 1 1 N"
     HcoPrevLine4='\* BC_CH4'
     ExtPrevLine1="#SCALE_ELEM_000N  1 N Y 2000-01-01T00:00:00 none none StateVector ./RunDirs/StateVector.nc"
-    HisPrevLine1="'SpeciesConcVV_CH4    ', 'GCHPchem',"
+    HisPrevLine1="'SpeciesConcVV_CH4"
 
     # Loop over state vector element numbers for this run and add each element
     # as a CH4 tracer in the configuraton files
@@ -425,10 +425,14 @@ create_simulation_dir() {
             for i in $(seq $start_element $end_element); do
                 add_new_tracer
             done
-            # remove redundant SpeciesConcVV_CH4 when $x > 1
-            if "$UseGCHP"; then
-                if [ $x -gt 1 ]; then
+            # remove redundant default CH4 output when perturbation runs
+            # already carry explicit Jacobian tracer diagnostics
+            if [ $x -gt 1 ]; then
+                if "$UseGCHP"; then
                     perl -0777 -pe "s/'SpeciesConcVV_CH4\s*',\s*'GCHPchem',\s*\n\s*('SpeciesConcVV_CH4_\d{4}',\s*'GCHPchem',)/\1/" \
+                    -i HISTORY.rc
+                else
+                    perl -0777 -pe "s/'SpeciesConcVV_CH4\s*',\s*\n\s*('SpeciesConcVV_CH4_\d{4}'\s*,)/\1/" \
                     -i HISTORY.rc
                 fi
             fi
@@ -500,7 +504,11 @@ add_new_tracer() {
         sed -i -e "\|$ExtPrevLine1|a $ExtNewLine1" ExtData.rc
         ExtPrevLine1=$ExtNewLine1
 
-        HisNewLine1="                              'SpeciesConcVV_CH4_$istr', 'GCHPchem',"
+        if "$UseGCHP"; then
+            HisNewLine1="                              'SpeciesConcVV_CH4_$istr', 'GCHPchem',"
+        else
+            HisNewLine1="                              'SpeciesConcVV_CH4_$istr',"
+        fi
         sed -i -e "/${HisPrevLine1}/a\\"$'\n'"${HisNewLine1}" HISTORY.rc
         HisPrevLine1=$HisNewLine1
     fi
@@ -601,8 +609,13 @@ cd \${RUNDIR}" jacobian_runs/run_jacobian_simulations.sh
             precomputedJacobianCachePrefix=${ReferenceRunDir}/inversion
         fi
 
-        precomputedJacobianCache=${precomputedJacobianCachePrefix}/data_converted
-        ln -nsf $precomputedJacobianCache data_converted_reference
+        # With ObservationOnlyJacobianCache the Jacobian is read directly from the merged
+        # K_{start}_{end}.npz cache (invert.py load_merged_jacobian_products); no
+        # data_converted reference from a ReferenceRunDir is needed in that mode.
+        if ! "${ObservationOnlyJacobianCache:-false}"; then
+            precomputedJacobianCache=${precomputedJacobianCachePrefix}/data_converted
+            ln -nsf $precomputedJacobianCache data_converted_reference
+        fi
 
         # Run the prior simulation
         JacobianRunsDir=${RunDirs}/jacobian_runs
