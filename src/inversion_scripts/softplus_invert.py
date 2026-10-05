@@ -126,6 +126,7 @@ def run_softplus(
     mean_every=20,
     max_iter=None,
     tol=5e-3,
+    return_state=False,
 ):
     """Softplus-positivity inversion in normal-equation (KTinvSoK, KTinvSoy) space.
 
@@ -221,5 +222,12 @@ def run_softplus(
     xhat = sf.copy()
     delta = xhat - x_prior
     diagnostics = inversion_diagnostics(delta, KTinvSoK, KTinvSoy, ytinvSoy, inv_Sa, gamma, n_obs, n_roi)
+    if return_state:
+        # Latent state and per-element internals, for callers that build their own emission-space
+        # covariance / diagnostics (e.g. the South America research pipeline reuses this solver).
+        sf_median = z.copy()
+        sf_median[:n_roi] = softplus(z[:n_roi], scale)
+        state = {"z": z, "jacobian": deriv, "variance": variance, "sf_median": sf_median}
+        return xhat, delta, S_post, A, diagnostics, n_iter, state
     return xhat, delta, S_post, A, diagnostics, n_iter
 

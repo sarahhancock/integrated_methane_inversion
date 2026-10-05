@@ -12,6 +12,7 @@ import numpy as np
 import xarray as xr
 from netCDF4 import Dataset
 from src.inversion_scripts.invert import compute_so_normal_equations
+from src.inversion_scripts.lognormal_solver import run_lognormal
 from src.inversion_scripts.utils import ensure_float_list
 from src.inversion_scripts.make_gridded_posterior import make_gridded_posterior
 from src.utilities.config_utils import load_config
@@ -194,6 +195,14 @@ def lognormal_invert(config, state_vector_filepath, jacobian_sf):
 
     # fixed kappa of 10 following Chen et al., 2022 https://doi.org/10.5194/acp-22-10809-2022
     kappa = 10
+    # Under-relaxation of the lagged median->mean offset in the mean-fit (converges to the same fixed point;
+    # <1 damps for stability). 0.5 is the stable default; MeanRelaxation in the config can override.
+    mean_relaxation = float(config.get("MeanRelaxation", 0.5))
+    # Observation-error normal equations (M, v_bg, ytinvSoy) depend only on the diagonal So (per so_key), the
+    # fixed K_full/innovation, and the off-diagonal So config -- NOT on the prior hyperparameters. Assemble once
+    # per distinct So and reuse across the hyperparameter combinations (the off-diagonal block-Thomas solve is
+    # expensive), so So^-1 is applied a single time instead of every iteration of every combination.
+    _mv_by_so = {}
 
     # iterate through different combination of gamma, lnsa, and sa_bc
     # TODO: parallelize this once we allow vectorization of these values
@@ -340,113 +349,36 @@ def lognormal_invert(config, state_vector_filepath, jacobian_sf):
         invlnsa = np.linalg.inv(lnsa)
         invlnsa_constraint = np.linalg.inv(lnsa_constraint)
 
-        # we start with lnxa using the prior values (scale factors of ln(1))
-        lnxn = lnxa
-
-        # start with arbitrary value for xn_iteration_pct_diff above .05%
-        xn_iteration_pct_diff = 1
-
-        # Iterate for calculation of ln(xn) until convergence threshold is met (5e-3)
-        # We decompose eqn 2 from chen et al into 4 terms
-        # term 1: gamma*K'.T@inv(So)@K'
-        # term 2: inv((1+kappa)*inv(ln(sa)))
-        # term 3: gamma*K'.T@inv(So)@(y_ybkg_diff - K@xn)
-        # term 4: -inv(ln(sa))@(ln(xn) - ln(xa))
-        # We can then solve for xn iteratively by doing:
-        # ln(xn) = x(n-1) + inv(term1+term2)@(term3 + term4)
-        # where x(n-1) is the previous iteration of xn until convergence
-        print("Status: Iterating to calculate ln(xn)")
-
-        # Initializing the mean of xn
-        xnmean = np.concatenate(
-            (np.exp(lnxn[:-num_normal_elems]) / prior_scale.reshape(-1, 1), lnxn[-num_normal_elems:]),
-            axis=0,
-        )
-    
-        while xn_iteration_pct_diff >= convergence_threshold:
-
-            # K_prime is the updated jacobian using the new xnmean from the previous iteration
-            K_prime = np.concatenate(
-                (K_ROI * xnmean[:-num_normal_elems].T, K_normal), axis=1
+        # --- Observation-error normal equations assembled ONCE, then the lognormal L-M solve iterates
+        #     algebraically via the shared run_lognormal (src/inversion_scripts/lognormal_solver.py). This
+        #     replaces the old per-iteration compute_so_normal_equations(K_prime, ...) -- essential for the
+        #     (expensive) off-diagonal So, which is now solved a single time -- and uses the mean-preserving
+        #     bookkeeping (prior emission MEAN = inventory), fixing the previous double-prior_scale mean bias.
+        _so_id = "rem" if so_rem is not None else so_key
+        if _so_id not in _mv_by_so:
+            _mv_by_so[_so_id] = compute_so_normal_equations(
+                K_full, y_ybkg_diff.flatten(), so, obs_lat, obs_lon, obs_dates, so_corr_params
             )
+        M, v_bg, _ytinvSoy = _mv_by_so[_so_id]
 
-            # Observation-error normal equations via the SHARED, solver-independent operator (identical
-            # So weighting to the normal/softplus path): KTinvSoK = K'^T So^-1 K',
-            # KTinvSo_resid = K'^T So^-1 (y - F(x)).  With so_corr_params=None this is the plain diagonal So.
-            residual = (y_ybkg_diff - K_full @ xnmean).flatten()
-            KTinvSoK, KTinvSo_resid, _ = compute_so_normal_equations(
-                K_prime, residual, so, obs_lat, obs_lon, obs_dates, so_corr_params
-            )
-            gKTinvSoK = gamma * KTinvSoK
-
-            # Compute the next xn_update (Chen et al. 2022, eqn 2)
-            term1 = gKTinvSoK
-            term2 = (1 + kappa) * invlnsa_constraint
-            inv_term = np.linalg.inv(term1 + term2)
-
-            # here xn and K need to be the mean
-            term3 = gamma * KTinvSo_resid.reshape(-1, 1)
-            # here lnxn and lnxa are the median
-            term4 = invlnsa_constraint @ (lnxn - lnxa)
-
-            # put it all together to calculate lnxn_update
-            lnxn_update = lnxn + inv_term @ (term3 - term4)
-
-            # Check for convergence
-            xn_iteration_pct_diff = max(
-                abs(
-                    np.exp(lnxn_update[:-num_normal_elems])
-                    - np.exp(lnxn[:-num_normal_elems])
-                )
-                / np.exp(lnxn[:-num_normal_elems])
-            )
-
-            lnxn = lnxn_update
-
-            # posterior error covariance matrix (uses unweighted Sa)
-            lns = np.linalg.inv(gKTinvSoK + invlnsa)
-
-            # Calculate posterior mean xhat
-            dlns = np.diag(lns[:-num_normal_elems, :-num_normal_elems])
-            # this xn is the median returned by the inversion
-            # needed for \hat x following Hancock et al. 2025, Eq. 6            
-            xn = np.concatenate(
-                (np.exp(lnxn[:-num_normal_elems]), lnxn[-num_normal_elems:]), axis=0
-            )
-            # Hancock et al. 2025, Eq. 6
-            xnmean = np.concatenate(
-                (
-                    xn[:-num_normal_elems]
-                    * np.expand_dims(np.exp(dlns * (0.5)) * prior_scale, axis=1),
-                    xn[-num_normal_elems:],
-                )
-            )
-
-        print("Status: Done Iterating")
-
-        # NORMAL (linear) averaging kernel for the DOFS diagnostic. The data resolution is a property of
-        # the PHYSICAL Jacobian, So, and prior and must NOT carry the log transform (matches the analytical
-        # and softplus solvers). Use the physical K^T So^-1 K from the untransformed K_full, and the
-        # physical prior covariance: the ROI relative covariance Sa_rel = e^{ln(1+Sa_rel)} - 1 recovered
-        # from the log block, plus the already-physical (unweighted) buffer/BC/OH block.
-        KTinvSoK_phys, _, _ = compute_so_normal_equations(
-            K_full, residual, so, obs_lat, obs_lon, obs_dates, so_corr_params
-        )
-        Md_phys = gamma * KTinvSoK_phys
+        # physical (untransformed) prior covariance for the linear (normal) averaging kernel / DOFS
         sa_phys = np.zeros((ntot, ntot))
         sa_phys[:n, :n] = np.expm1(lnSa_ROI)
         sa_phys[norm_idx, norm_idx] = sa_normal.flatten()
-        w_sp, V_sp = np.linalg.eigh(0.5 * (sa_phys + sa_phys.T))
-        sa_phys = (V_sp * np.clip(w_sp, 1.0e-10, None)) @ V_sp.T
-        ak = np.linalg.solve(Md_phys + np.linalg.inv(sa_phys), Md_phys)
 
-        # Calculate Ja diagnostic only for domain of interest (ignoring buffer and BC elements)
-        # Ja diagnostic is useful for determining regurlarization parameter (gamma)
-        Ja = (
-            np.transpose(lnxn[:-num_normal_elems] - lnxa[:-num_normal_elems])
-            @ invlnsa[:-num_normal_elems, :-num_normal_elems]
-            @ (lnxn[:-num_normal_elems] - lnxa[:-num_normal_elems])
+        print("Status: Iterating to calculate ln(xn)")
+        result = run_lognormal(
+            M, v_bg, invlnsa, invlnsa_constraint, lnxa, prior_scale, n, num_normal_elems,
+            gamma=gamma, kappa=kappa, convergence_threshold=convergence_threshold, max_iter=1000,
+            mean_fit=True, mean_relaxation=mean_relaxation, medjac=False, clip_lnxn=(-40.0, 10.0),
+            sa_phys=sa_phys,
         )
+        print("Status: Done Iterating")
+        xnmean = result["xhat"]
+        lnxn = result["lnxn"]
+        lns = result["S_post"]
+        ak = result["A"]
+        Ja = np.float64(result["Ja"])
 
         print(
             f"Diagnostics:\n  (Ja: {Ja}, gamma: {gamma}, "
