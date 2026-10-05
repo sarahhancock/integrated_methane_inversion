@@ -26,6 +26,14 @@ def prepare_sf(config_path, period_number, base_directory, nudge_factor, species
     # Read config file
     config = load_config(config_path)
 
+    # Soil-sink optimization: optimize the NET flux (EmisCH4_Total, incl soil absorption) instead of
+    # emissions-only (EmisCH4_Total_ExclSoilAbs). In the net basis a net-negative flux is a physical
+    # sink, so we do NOT clip negative posterior emissions -- the nudge factor tempers swings instead.
+    # Both config-guarded (defaults preserve the original emissions-only + clip behavior).
+    optimize_soil = bool(config.get("OptimizeSoilSink", False))
+    clip_negative_emis = bool(config.get("ClipNegativePosteriorEmis", not optimize_soil))
+    ch4_emis_key = "EmisCH4_Total" if optimize_soil else "EmisCH4_Total_ExclSoilAbs"
+
     # Fix nudge_factor type
     nudge_factor = float(nudge_factor)
 
@@ -77,7 +85,7 @@ def prepare_sf(config_path, period_number, base_directory, nudge_factor, species
                 original_prior_cache, p, periods_csv_path
             )
             if species == "CH4":
-                original_emis = original_emis_ds["EmisCH4_Total_ExclSoilAbs"]
+                original_emis = original_emis_ds[ch4_emis_key]
             else:
                 original_emis = original_emis_ds[f"Emis{species}_Total"]
 
@@ -98,15 +106,17 @@ def prepare_sf(config_path, period_number, base_directory, nudge_factor, species
             )
             current_posterior_emis = original_emis * posterior_scale_ds["ScaleFactor"]
 
-            # Set areas with negative emissions to 0.
-            # These areas will be repopulated with the nudge prior emissions
-            current_positive_posterior_emis = current_posterior_emis.where(
-                current_posterior_emis > 0, 0
-            )
+            # Emissions-only basis clips negative posterior emissions to 0 (a negative emission is
+            # unphysical). Net-flux (soil-sink) basis KEEPS them: a net-negative flux is a physical
+            # sink, so clipping would wrongly zero real sinks -- the nudge factor tempers swings instead.
+            if clip_negative_emis:
+                emis_for_nudge = current_posterior_emis.where(current_posterior_emis > 0, 0)
+            else:
+                emis_for_nudge = current_posterior_emis
 
             nudged_posterior_emis = (
                 nudge_factor * original_emis
-                + (1 - nudge_factor) * current_positive_posterior_emis
+                + (1 - nudge_factor) * emis_for_nudge
             )  # TODO nudge_factor is currently inverse of what's in the paper, i.e. 0.1 instead of 0.9
 
             # Sum emissions

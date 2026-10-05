@@ -1472,18 +1472,26 @@ def update_prior_error_for_OptimizeSoil(
 
     prior_err = np.zeros(n_elements)
 
+    # OptimizeSoil scales the NET flux (gross emission minus soil uptake) by one scale factor. The
+    # SF's prior relative error is the combined (independent) gross+soil uncertainty, expressed
+    # relative to the cell's DOMINANT activity magnitude max(|gross|, |soil|) -- NOT the net flux.
+    # Dividing by the net flux diverges (and flips sign) for near-zero-net cells (gross ~ |soil|),
+    # leaving them unconstrained -> SF blow-up that the sequential RTPS covariance inflation then
+    # compounds without bound. Dividing by the dominant activity keeps the relative error in
+    # [org_prior_error, org_prior_error*sqrt(2)] -- bounded (so RTPS stays stable, since the per-period
+    # amplification < 1/(1-alpha)) and parameter-free -- while still reflecting that the net is a
+    # difference of two uncertain terms.
     for i in range(1, last_ROI_element + 1):
         mask = state_vector_labels == i
 
-        # mean emissions & soil sinks for this state vector element
+        # mean gross emission & soil sink for this state vector element
         emisi = np.nanmean(prior_emis[mask])
         soili = np.nanmean(prior_soil[mask])
-        fluxi = np.nanmean(prior_flux[mask])
-
-        if abs(fluxi) > 0:
+        scale = max(abs(emisi), abs(soili))              # dominant activity magnitude
+        if scale > 0:
             prior_err[i - 1] = (
                 np.sqrt((org_prior_error * emisi) ** 2 + (org_prior_error * soili) ** 2)
-                / fluxi
+                / scale
             )
     return prior_err
 
