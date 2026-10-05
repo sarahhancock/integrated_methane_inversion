@@ -129,16 +129,30 @@ def element_geometry_and_sector_emissions(state_vector_subset, prior, sector_fie
     return elat, elon, sector_emis
 
 
-def load_wetland_ensemble_sigma(path, config, elat, elon):
+# Gaussian range-statistic constants d2(N) (Shewhart control-chart / order-statistic table): for N samples
+# from a normal, E[max-min] = d2(N)*sigma, so range/d2(N) is the standard bias-corrected estimate of sigma from
+# the range. A wetland file's 'rel' is stored AS range/d2 (i.e. already the sigma estimate); the optional
+# SectorEnsembleWetlandRawRange instead uses the raw peak-to-peak RANGE by multiplying rel back up by d2(N) --
+# a looser, ~1.7x-inflated choice (NOT an unbiased sigma). N read from the ensemble ('names'/'clim'). d2(3)=1.693.
+_D2_CONST = {2: 1.128, 3: 1.693, 4: 2.059, 5: 2.326, 6: 2.534, 7: 2.704, 8: 2.847, 9: 2.970, 10: 3.078}
+
+
+def load_wetland_ensemble_sigma(path, config, elat, elon, month=None):
     """Map a gridded wetland ensemble relative error onto the state-vector elements.
 
-    The ensemble file (npz or netCDF) provides a per-cell relative 1-sigma error
-    (inter-model spread; variable SectorEnsembleWetlandVar, default 'rel') on a lat/lon
-    grid, and optionally a scalar correlation length 'L_km'. A 3-D (month, lat, lon) field
-    is averaged over months. Returns (sigma_per_element, length_km).
+    The ensemble file (npz or netCDF) provides a per-cell relative 1-sigma error (inter-model spread;
+    variable SectorEnsembleWetlandVar, default 'rel') on a lat/lon grid, and optionally a scalar
+    correlation length 'L_km'. A 3-D field is (month, lat, lon):
+      * SectorEnsembleWetlandMonthly (default ON) + a 12-month climatology + the period's `month` ->
+        that calendar month's field is used (the seasonal wetland disagreement for the month being solved),
+      * otherwise the field is averaged over months (annual mean).
+    In both cases the non-finite fallback is the ANNUAL-mean grid median (matching compute_table's SIGWET_M).
+    SectorEnsembleWetlandRawRange (default OFF) multiplies by d2(N) to convert stored range/d2 -> raw range.
+    Returns (sigma_per_element, length_km).
     """
     var = config.get("SectorEnsembleWetlandVar", "rel")
     length_km = None
+    n_members = None
     if str(path).endswith(".npz"):
         data = np.load(path, allow_pickle=True)
         if var not in data.files:
@@ -148,6 +162,10 @@ def load_wetland_ensemble_sigma(path, config, elat, elon):
         wlon = np.asarray(data["lon"], dtype=np.float64)
         if "L_km" in data.files:
             length_km = float(data["L_km"])
+        if "names" in data.files:
+            n_members = int(np.asarray(data["names"]).size)
+        elif "clim" in data.files:
+            n_members = int(np.asarray(data["clim"]).shape[0])
     else:
         ds = xr.open_dataset(path)
         rel = np.asarray(ds[var].values, dtype=np.float64)
@@ -155,22 +173,62 @@ def load_wetland_ensemble_sigma(path, config, elat, elon):
         wlon = np.asarray(ds["lon"].values, dtype=np.float64)
         if "L_km" in ds:
             length_km = float(ds["L_km"].values)
-    if rel.ndim == 3:            # (month, lat, lon) -> annual mean
-        rel = np.nanmean(rel, axis=0)
-    finite = np.isfinite(rel)
-    median = float(np.nanmedian(rel[finite])) if finite.any() else 0.5
-    sigma = np.full(len(elat), median, dtype=np.float64)
+        for _cand in ("names", "member", "members", "ensemble", "model"):        # ensemble size for the d2(N) raw-range factor
+            if _cand in getattr(ds, "dims", {}):
+                n_members = int(ds.sizes[_cand]); break
+            if _cand in getattr(ds, "variables", {}):
+                n_members = int(np.asarray(ds[_cand].values).size); break
+
+    wet_mode = "2-D (no month axis)"
+    if rel.ndim == 3:            # (month, lat, lon)
+        annual = np.nanmean(rel, axis=0)                                   # for the non-finite fallback median
+        monthly = str(config.get("SectorEnsembleWetlandMonthly", True)).strip().lower() in ("true", "1", "yes")
+        if monthly and month is not None and rel.shape[0] == 12:
+            rel = rel[int(month) - 1]                                      # this calendar month's climatology
+            wet_mode = f"climatology month {int(month):02d} of 12"
+        else:
+            if monthly and month is not None and rel.shape[0] != 12:
+                print(f"  WARNING: SectorEnsembleWetlandMonthly is ON but the wetland field has {rel.shape[0]} "
+                      f"time slices (not a 12-month climatology) -> falling back to the ANNUAL MEAN. Provide a "
+                      f"12-month climatology for month-specific wetland uncertainty.")
+            elif monthly and month is None:
+                print("  WARNING: SectorEnsembleWetlandMonthly is ON but no period month was resolved from "
+                      "StartDate -> using the ANNUAL MEAN wetland sigma.")
+            rel = annual
+            wet_mode = "annual mean"
+        fallback = float(np.nanmedian(annual[np.isfinite(annual)])) if np.isfinite(annual).any() else 0.5
+    else:
+        fallback = float(np.nanmedian(rel[np.isfinite(rel)])) if np.isfinite(rel).any() else 0.5
+
+    sigma = np.full(len(elat), fallback, dtype=np.float64)
     for i in range(len(elat)):
         jlat = int(np.argmin(np.abs(wlat - elat[i])))
         jlon = int(np.argmin(np.abs(wlon - elon[i])))
         value = rel[jlat, jlon]
         if np.isfinite(value):
             sigma[i] = value
+    # raw-range conversion (range/d2 -> raw range) by d2(N); N from the ensemble, override via WetlandDVal.
+    if str(config.get("SectorEnsembleWetlandRawRange", False)).strip().lower() in ("true", "1", "yes"):
+        _explicit = config.get("SectorEnsembleWetlandDVal")
+        if _explicit is not None:
+            d2 = float(_explicit)
+        elif n_members and n_members in _D2_CONST:
+            d2 = _D2_CONST[n_members]
+        else:
+            d2 = 1.0
+            print(f"  WARNING: SectorEnsembleWetlandRawRange is ON but the ensemble member count could not be "
+                  f"determined from the wetland file (n_members={n_members}) and SectorEnsembleWetlandDVal is "
+                  f"unset -> d2=1.0, so the raw-range scaling is a NO-OP. Set SectorEnsembleWetlandDVal to the "
+                  f"range->sigma factor d2(N) for your ensemble (d2(3)=1.693).")
+        sigma = sigma * d2
+        wet_mode += f" x raw-range d2(N={n_members})={d2:.3f}"
     scale = float(config.get("SectorEnsembleWetlandSigmaScale", 1.0))
     floor = float(config.get("SectorEnsembleSigmaFloor", 0.15))
     cap = float(config.get("SectorEnsembleSigmaCap", 2.0))
     sigma = np.clip(sigma * scale, floor, cap)
     length_km = float(config.get("SectorEnsembleWetlandLengthKm", length_km if length_km else 161.0))
+    print(f"  Wetland ensemble sigma: {wet_mode}; median {float(np.median(sigma)):.2f} "
+          f"[{float(sigma.min()):.2f},{float(sigma.max()):.2f}] over {len(elat)} elements.")
     return sigma, length_km
 
 
@@ -226,8 +284,31 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
     if not domain_invariant_enabled(config):
         country_fraction = None
     elif country_fraction:                                    # non-empty: at least one country matched
-        print(f"Domain-invariant national term ON: f_C for {len(country_fraction)} countries "
-              f"(min {min(country_fraction.values()):.2f}, max {max(country_fraction.values()):.2f}).")
+        print(f"Domain-invariant national term ON (f_C emission-based where available): f_C for "
+              f"{len(country_fraction)} countries (min {min(country_fraction.values()):.2f}, "
+              f"max {max(country_fraction.values()):.2f}).")
+
+    # Saunois GLOBAL-BACKGROUND emission fractions f_sector = E_domain / E_global (from the user's HEMCO global
+    # inventories) for the wetland + generic naturals systematic sigma_sys = G * f. Built once and cached; this
+    # is a cache HIT if build_country_mask_from_shapes populated it above, else a fresh sector-only build. An
+    # empty dict (no HEMCO config / scaling disabled) -> f defaults to 1 (unscaled, full-global amplitude) with
+    # a warning, so a missing HEMCO config never crashes the run.
+    try:
+        from src.inversion_scripts.build_global_emission_fractions import emission_fractions_for_config
+    except ModuleNotFoundError:
+        try:
+            from build_global_emission_fractions import emission_fractions_for_config
+        except ModuleNotFoundError:
+            emission_fractions_for_config = None
+    sector_fraction = {}
+    if emission_fractions_for_config is not None:
+        _ef = emission_fractions_for_config(config, prior)
+        if _ef:
+            sector_fraction = _ef.get("sector_fraction") or {}
+    if not sector_fraction:
+        print("WARNING: no emission fractions f_sector available (HEMCO config not resolved or scaling "
+              "disabled); the wetland/generic Saunois background falls back to f=1 (full-global amplitude, "
+              "sigma_sys=G). Set EmissionFractionHemcoConfig to scale it by the domain's emission share.")
 
     rows, totals_by_element, neff_sum, neff_sumsq = emission_weighted_element_table(
         state_vector_subset, country_mask, prior, sector_fields, roi_ids
@@ -266,34 +347,40 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
     wetland_handled = False
     length_w = None                                        # wetland ensemble length, reused by the generic block below
     if wetland_file and "Wetlands" in sector_emis:
-        sigma_w, length_w = load_wetland_ensemble_sigma(wetland_file, config, elat, elon)
+        # calendar month of the period being built (covariance builders run per-month) -> the wetland
+        # climatology's month-specific uncertainty, matching compute_table's SIGWET_M[month].
+        try:
+            _wet_month = int(str(start_date)[4:6])
+        except Exception:
+            _wet_month = None
+        sigma_w, length_w = load_wetland_ensemble_sigma(wetland_file, config, elat, elon, month=_wet_month)
         e_w = sector_emis["Wetlands"]
         we = sigma_w * e_w
         Cw = np.exp(-dist / length_w)                      # ensemble correlation (161 km)
-        rho_w = 0.0
+        rho_w = 0.0                                        # kept for the diagnostics dict; no longer a floor
+        Sa_abs += np.outer(we, we) * Cw                    # ensemble covariance block (per-cell sigma unchanged)
+        sigma_sys_w = 0.0
         if str(config.get("SectorEnsembleWetlandGlobalBackground", True)).strip().lower() in ("true", "1", "yes"):   # default ON
-            # Saunois global background for wetlands (the natural-emission analogue of the anthro
-            # cross-country term): a domain-wide correlation FLOOR added to the ensemble correlation,
-            #     C = (1 - rho) * exp(-d/L) + rho.
-            # The diagonal stays 1 so the per-cell ensemble sigma is UNCHANGED; rho is solved so the
-            # continental wetland aggregate equals the Saunois wetland target g_wet (never averages
-            # below it). Wetlands carry no BTR national aggregate to preserve, so a uniform floor is
-            # appropriate (it does raise the wetland national aggregate, which is intended).
+            # Saunois GLOBAL BACKGROUND for wetlands: a fully-correlated, emission-weighted systematic scaled by
+            # the domain's emission SHARE of the global wetland sector,  sigma_sys = G_wet * f_wet,
+            # f_wet = E_domain / E_global.  Sa += (G_wet f_wet)^2 outer(E_wet, E_wet).  Applied globally (f=1)
+            # the continental aggregate == G_wet; over a sub-domain it carries only that domain's share, so the
+            # aggregate = sqrt(genuine^2 + (G_wet f_wet)^2).  This REPLACES the old convex rho-floor that forced
+            # the sub-domain aggregate to the full global G_wet (treating the sub-domain as the whole globe).
             g_wet = float(config.get("SectorEnsembleWetlandGlobalValue", 0.28))
-            E_wet = float(e_w.sum()); var0 = float(we @ Cw @ we); full = float(we.sum()) ** 2
-            denom = full - var0
-            rho_w = float(np.clip(((g_wet * E_wet) ** 2 - var0) / denom, 0.0, 1.0)) if denom > 1e-9 else 0.0
-            Cw = (1.0 - rho_w) * Cw + rho_w
-            achieved = np.sqrt(max((1 - rho_w) * var0 + rho_w * full, 0.0)) / E_wet if E_wet > 0 else 0.0
-            print(f"Wetland global background ON: g_wet={g_wet:.2f}, rho={rho_w:.3f}, "
-                  f"continental wetland aggregate {np.sqrt(max(var0,0))/E_wet if E_wet>0 else 0:.3f} -> {achieved:.3f} "
+            f_wet = float(sector_fraction.get("Wetlands", 1.0))
+            sigma_sys_w = g_wet * f_wet
+            Sa_abs += (sigma_sys_w * sigma_sys_w) * np.outer(e_w, e_w)
+            E_wet = float(e_w.sum())
+            gen = (np.sqrt(max(float(we @ Cw @ we), 0.0)) / E_wet) if E_wet > 0 else 0.0
+            print(f"Wetland Saunois background ON: G_wet={g_wet:.2f} x f_wet={f_wet:.3f} -> sigma_sys={sigma_sys_w:.3f}; "
+                  f"continental aggregate {gen:.3f} -> {np.sqrt(gen*gen + sigma_sys_w*sigma_sys_w):.3f} "
                   f"(per-cell sigma unchanged).")
-        Sa_abs += np.outer(we, we) * Cw
         wetland_handled = True
         pos = e_w > 0
         diagnostics.append({
             "sector": "Wetlands", "status": "ok", "method": "ensemble",
-            "length_km": length_w, "rho_global": rho_w,
+            "length_km": length_w, "rho_global": rho_w, "saunois_sigma_sys": float(sigma_sys_w),
             "sigma_median": float(np.median(sigma_w[pos])) if pos.any() else 0.0,
             "n_elements": int(pos.sum()),
         })
@@ -337,34 +424,41 @@ def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_ele
         sb = generic_sigma * e_non
         K_gen = np.exp(-dist / generic_length) * similarity                 # the generic block's kernel (K o S)
         Sa_abs += np.outer(sb, sb) * K_gen
-        # Saunois GLOBAL BACKGROUND for the minor naturals -- the analogue of the wetland floor and the
-        # anthro global term. Each sector gets a domain-wide, fully-correlated systematic c_s * outer(e_s, e_s)
-        # so its CONTINENTAL aggregate equals the Saunois value g_s EXACTLY. The sector's own local continental
-        # variance is PEELED out first (c_s = g_s^2 - local_var_s / E_s^2), so local + floor = g_s^2 (same trick
-        # as u_res = sqrt(u_BTR^2 - g^2) for anthro). c_s clips at 0 if the local aggregate already exceeds g_s.
-        # Defaults to SAUNOIS_GLOBAL_BACKGROUND; ON by default.
+        # Saunois GLOBAL BACKGROUND for the minor naturals -- the analogue of the wetland systematic. Each
+        # sector gets a domain-wide, fully-correlated systematic c_s * outer(e_s, e_s) with amplitude scaled by
+        # the domain's emission SHARE of that global sector:  sqrt(c_s) = sigma_sys = G_s * f_s,
+        # f_s = E_domain / E_global (from the user's HEMCO global inventories).  Applied globally (f=1) the
+        # sector's continental aggregate == G_s; over a sub-domain it carries only that share, so the aggregate
+        # = sqrt(genuine^2 + (G_s f_s)^2).  This REPLACES the old deficit-peel (c_s = G_s^2 - local_var/E^2) that
+        # forced the sub-domain aggregate to the full global G_s.  G_s defaults to SAUNOIS_GLOBAL_BACKGROUND.
         gbg = None
         if str(config.get("SectorEnsembleGenericGlobalBackground", True)).strip().lower() in ("true", "1", "yes"):   # default ON
             gbg = dict(SAUNOIS_GLOBAL_BACKGROUND)
             gbg.update(config.get("SectorEnsembleGenericGlobalBackgroundValues", {}) or {})
+            _sys_by_sector = {}
             for s in generic_sectors:
                 g = float(gbg.get(s, 0.0)); es = sector_emis[s]; Es = float(es.sum())
                 if g <= 0.0 or Es <= 0.0:
                     continue
-                local_var = generic_sigma * generic_sigma * float(es @ K_gen @ es)       # sector s's OWN continental variance
-                c = max(g * g - local_var / (Es * Es), 0.0)                              # FLOOR: local + floor = g_s exactly
-                Sa_abs += c * np.outer(es, es)
+                f_s = float(sector_fraction.get(s, 1.0))                                 # domain emission share of global sector s
+                sigma_sys = g * f_s                                                      # sigma_sys = G_s * f_s
+                _sys_by_sector[s] = sigma_sys
+                Sa_abs += (sigma_sys * sigma_sys) * np.outer(es, es)                     # additive fully-correlated systematic
+            if _sys_by_sector:
+                print("GENERIC Saunois background sqrt(c)=G_s*f_s: "
+                      + ", ".join(f"{s}={_sys_by_sector[s]:.3f}" for s in sorted(_sys_by_sector)))
         for s in generic_sectors:                                           # per-sector diagnostics
             es = sector_emis[s]
             diagnostics.append({
                 "sector": s, "status": "ok", "method": "generic",
                 "length_km": generic_length, "sigma": generic_sigma,
                 "global_background": float(gbg.get(s, 0.0)) if gbg is not None else 0.0,
+                "saunois_sigma_sys": float(gbg.get(s, 0.0)) * float(sector_fraction.get(s, 1.0)) if gbg is not None else 0.0,
+                "emission_fraction": float(sector_fraction.get(s, 1.0)),
                 "n_elements": int((es > 0).sum()),
             })
         print(f"Generic correlated block: sectors={generic_sectors}, sigma={generic_sigma}, "
-              f"L={generic_length:.0f} km, Saunois floor={'on' if gbg is not None else 'off'}"
-              + (f" (e.g. Reservoirs={gbg.get('Reservoirs')}, BiomassBurn={gbg.get('BiomassBurn')})" if gbg else "") + ".")
+              f"L={generic_length:.0f} km, Saunois background={'on (sigma_sys=G*f)' if gbg is not None else 'off'}.")
 
     # ---- decompose to (correlation, sigma), PSD-repair, append buffer, write ----
     covariance, sigma_vector = decompose_relative_covariance(Sa_abs, totals_by_element, prior_sigma)

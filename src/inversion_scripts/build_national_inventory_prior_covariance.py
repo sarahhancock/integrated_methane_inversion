@@ -272,7 +272,13 @@ def domain_invariant_enabled(config):
     return str(val).strip().lower() in ("true", "1", "yes")
 
 
-def build_country_mask_from_shapes(uncertainty_rows, prior, config):
+def build_country_mask_from_shapes(uncertainty_rows, prior, config, emission_country_fraction=None):
+    """Assign each domain cell to the country covering the most of it, and return the per-country in-domain
+    fraction f_C for the domain-invariant national term. f_C is the in-domain EMISSION fraction when
+    `emission_country_fraction` (a {country_name: f_C} dict from build_global_emission_fractions, computed
+    off the user's HEMCO global inventories) is supplied -- the faithful treatment for a country only
+    partly in the domain (fragments of neighbours); otherwise it is the AREA fraction (indomain_area_fraction),
+    exact only under uniform emission density. A country missing from the emission dict falls back to area."""
     # Default to the bundled global shapefile so any IMI user gets per-country masks with no setup.
     shapefile = config.get("NationalPriorCountryShapefile") or default_country_shapefile()
     name_column = config.get("NationalPriorCountryNameColumn", "NAME")
@@ -284,6 +290,22 @@ def build_country_mask_from_shapes(uncertainty_rows, prior, config):
         return None, None
 
     shapes = load_country_shapes(shapefile, name_column)
+    # In-domain EMISSION fraction f_C from the user's HEMCO global inventories (self-contained: any caller,
+    # incl. build_national_inventory_prior_covariance.main, gets emission-based f_C for country fragments with
+    # no wiring). A caller may pass emission_country_fraction to override / avoid a second cache read. Any
+    # failure (no HEMCO config, parse error, scaling disabled) leaves it None -> the area fraction is used.
+    if emission_country_fraction is None and area_weighting and domain_invariant:
+        try:
+            from src.inversion_scripts.build_global_emission_fractions import emission_fractions_for_config
+        except ModuleNotFoundError:
+            try:
+                from build_global_emission_fractions import emission_fractions_for_config
+            except ModuleNotFoundError:
+                emission_fractions_for_config = None
+        if emission_fractions_for_config is not None:
+            _res = emission_fractions_for_config(config, prior, shapes=shapes, name_column=name_column)
+            if _res:
+                emission_country_fraction = _res.get("country_fraction") or None
     mask = xr.DataArray(
         np.zeros((prior.sizes["lat"], prior.sizes["lon"]), dtype=float),
         coords={"lat": prior.lat.values, "lon": prior.lon.values},
@@ -320,6 +342,11 @@ def build_country_mask_from_shapes(uncertainty_rows, prior, config):
         best_fraction[replace] = fraction[replace]
         mask.values[:] = current
         country_lookup[country_name] = country_id
+        # Prefer the in-domain EMISSION fraction (user's HEMCO global inventories) over the AREA fraction for
+        # the domain-invariant 1/f_C^2 term -- correct for country fragments where emission density is non-uniform.
+        if emission_country_fraction and str(country_name) in emission_country_fraction:
+            f_c = float(emission_country_fraction[str(country_name)])
+            f_c = min(max(f_c, 0.0), 1.0)
         country_fraction[str(country_id)] = f_c               # str key: two_component_absolute looks up by str id
         row["country_id"] = str(country_id)
 
@@ -350,6 +377,11 @@ def build_country_mask_from_shapes(uncertainty_rows, prior, config):
                   f"({shown}); with NationalPriorDomainInvariant off their national uncertainty is "
                   f"applied as if fully in-domain. Set NationalPriorDomainInvariant: true to scale the "
                   f"national term by the in-domain fraction (1/f_C^2).")
+    if area_weighting and country_fraction:
+        n_emis = sum(1 for cn in country_lookup if emission_country_fraction and str(cn) in emission_country_fraction)
+        basis = (f"EMISSION fraction for {n_emis}/{len(country_lookup)} countries (rest AREA)"
+                 if emission_country_fraction else "AREA fraction")
+        print(f"  Domain-invariant national term f_C basis: {basis}.")
     return mask, country_fraction
 
 
