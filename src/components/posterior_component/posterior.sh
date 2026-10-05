@@ -72,7 +72,18 @@ setup_posterior() {
             fi
         fi
     fi
+    # Sequential KF: the posterior sim carries the propagated concentration IC -- period 1 is seeded
+    # (spun-up SpeciesRst restart), period>=2 chains from the PREVIOUS period's posterior-sim output
+    # already present in this reused Restarts/ dir. Do NOT overwrite an existing restart with the
+    # RestartFilePrefix (blended-BC) file, which holds SpeciesBC_CH4 not SpeciesRst_CH4 (GC_RESTART
+    # would fail) and would break IC propagation. Non-KF runs are unaffected.
+    KFExistingRestart="Restarts/GEOSChem.Restart.${StartDate}_0000z.nc4"
     if "$UseGCHP"; then
+        KFExistingRestart="Restarts/GEOSChem.Restart.${StartDate}_0000z.c${CS_RES}.nc4"
+    fi
+    if "$KalmanMode" && [ -e "$KFExistingRestart" ]; then
+        printf "KalmanMode: reusing existing posterior IC restart %s (seeded/chained); not relinking from RestartFilePrefix\n" "$KFExistingRestart"
+    elif "$UseGCHP"; then
         ln -nsf $RestartFile Restarts/GEOSChem.Restart.${StartDate}_0000z.c${CS_RES}.nc4
     else
         ln -nsf $RestartFile Restarts/GEOSChem.Restart.${StartDate}_0000z.nc4

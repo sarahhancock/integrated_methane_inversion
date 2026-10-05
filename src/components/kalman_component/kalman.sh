@@ -3,6 +3,7 @@
 # Functions available in this file include:
 #   - setup_kf
 #   - run_kf
+#   - run_resumable_monthly_kf
 #   - run_period
 #   - get_oh_rundir_suffix
 
@@ -14,12 +15,12 @@ setup_kf() {
 
     # Create a parent directory for the Kalman filter inversions
     # Include a link to the state vector file for use with run_inversion.sh
-    mkdir -p ${RunDirs}/kf_inversions
-    ln -sf $StateVectorFile ${RunDirs}/kf_inversions/StateVector.nc
+    mkdir -p ${RunDirs}/${KalmanInversionSubdir:-kf_inversions}
+    ln -sf $StateVectorFile ${RunDirs}/${KalmanInversionSubdir:-kf_inversions}/StateVector.nc
 
     # copy kf notebook to kf_inversions directory
-    cp ${InversionPath}/src/notebooks/kf_notebook.ipynb ${RunDirs}/kf_inversions/
-    sed -i 's|\/home\/ubuntu\/integrated_methane_inversion\/config.yml|'$ConfigPath'|g' ${RunDirs}/kf_inversions/kf_notebook.ipynb
+    cp ${InversionPath}/src/notebooks/kf_notebook.ipynb ${RunDirs}/${KalmanInversionSubdir:-kf_inversions}/
+    sed -i 's|\/home\/ubuntu\/integrated_methane_inversion\/config.yml|'$ConfigPath'|g' ${RunDirs}/${KalmanInversionSubdir:-kf_inversions}/kf_notebook.ipynb
 
     # Define Kalman filter update periods
     if "$MakePeriodsCSV"; then
@@ -46,6 +47,33 @@ setup_kf() {
             nElements=$((nElements + 2))
         fi
     fi
+}
+
+# Description: Run the resumable monthly Kalman workflow.
+# Usage:
+#   run_resumable_monthly_kf
+run_resumable_monthly_kf() {
+    local monthly_stage="${MonthlyKalmanStage:-inversion}"
+    local monthly_end="${MonthlyKalmanEndDate:-${FinalDate:-$EndDate}}"
+    local monthly_start="${MonthlyKalmanStartDate:-}"
+    local monthly_nudge="${MonthlyKalmanNudgeFactor:-$NudgeFactor}"
+    local kalman_dir="${InversionPath}/src/components/kalman_component"
+
+    case "$monthly_stage" in
+        obs_products|prepare_obs_products|prepare_obs_products_for_so)
+            bash "${kalman_dir}/run_prepare_obs_products_for_so.sh" \
+                "$ConfigFile" "$monthly_end" "$monthly_start"
+            ;;
+        inversion|jacobian_inversion|jacobians_kalman)
+            bash "${kalman_dir}/run_monthly_jacobians_kalman.sh" \
+                "$ConfigFile" "$monthly_end" "$monthly_nudge" "$monthly_start"
+            ;;
+        *)
+            printf "Unknown MonthlyKalmanStage: %s\n" "$monthly_stage" >&2
+            printf "Use obs_products or inversion.\n" >&2
+            exit 1
+            ;;
+    esac
 }
 
 # Description: Run Kalman filter inversions
@@ -96,8 +124,8 @@ run_period() {
     echo -e "\nPeriod ${period_i}"
 
     # Create inversion directory for the period
-    cp -r ${RunDirs}/inversion_template/. ${RunDirs}/kf_inversions/period${period_i}
-    sed -i -e "s:{PERIOD}:${period_i}:g" ${RunDirs}/kf_inversions/period${period_i}/run_inversion.sh
+    cp -r ${RunDirs}/inversion_template/. ${RunDirs}/${KalmanInversionSubdir:-kf_inversions}/period${period_i}
+    sed -i -e "s:{PERIOD}:${period_i}:g" ${RunDirs}/${KalmanInversionSubdir:-kf_inversions}/period${period_i}/run_inversion.sh
 
     # Get Start/End dates of current period from periods.csv
     ithLine=$(sed "$((period_i + 1))q;d" $PeriodsFile)
@@ -133,7 +161,7 @@ run_period() {
 
     # Prepare initial (prior) emission scale factors for the current period
     echo "python path = $PYTHONPATH"
-    python ${InversionPath}/src/components/kalman_component/prepare_sf.py $ConfigPath $period_i ${RunDirs} $NudgeFactor $Species; wait
+    python ${InversionPath}/src/components/kalman_component/prepare_sf.py $ConfigPath $period_i ${RunDirs} $NudgeFactor $Species || imi_failed $LINENO kalman.sh; wait
 
     # Dynamically generate state vector for each period
     if ("$ReducedDimensionStateVector" && "$DynamicKFClustering"); then
@@ -144,15 +172,23 @@ run_period() {
     ##  Submit all Jacobian simulations OR submit only the Prior simulation
     ##=======================================================================
 
-    # run jacobian simulation for the given period
-    run_jacobian
+    # run jacobian (prior) simulation for the given period.
+    # LinearPriorReuseProd forms the prior LINEARLY from the cached K (AdjustPriorWithScaleFactors)
+    # and reuses production's obs, so the prior GC sim is UNUSED by the inversion. Skip it -- the
+    # posterior sim below still runs and carries the concentration-IC chain (posterior_run restarts,
+    # independent of the prior sim). Saves ~2h/period. Config-guarded (default: run it as before).
+    if ! "${LinearPriorReuseProd:-false}"; then
+        run_jacobian
+    else
+        echo "LinearPriorReuseProd: skipping run_jacobian (prior GC sim unused; linear prior from cached K)"
+    fi
 
     # run inversion for the given period
     run_inversion
 
     # Update ScaleFactor.nc with the new posterior scale factors before running the posterior simulation
     # NOTE: This also creates the posterior_sf_period{i}.nc file in archive_sf/
-    python ${InversionPath}/src/components/kalman_component/multiply_posteriors.py $period_i ${RunDirs} $LognormalErrors
+    python ${InversionPath}/src/components/kalman_component/multiply_posteriors.py $ConfigPath $period_i ${RunDirs} $LognormalErrors || imi_failed $LINENO kalman.sh
     wait
     echo "Multiplied posterior scale factors over record"
 
