@@ -18,14 +18,6 @@ fi
 
 ### Run GEOS-Chem in the directory corresponding to the cluster Id
 cd  ${RUNDIR}/{RunName}_${xstr}
-# DEBUG/ITERATION reuse: if ${RUNDIR}/.reuse_prior_sim exists and this period's prior-sim
-# output is already present, skip the GEOS-Chem run and reuse it. This lets downstream
-# (inversion/posterior) fixes be tested without re-simulating an unchanged prior. Absent the
-# flag file (the real KF), behaviour is unchanged.
-if [[ -f "${RUNDIR}/.reuse_prior_sim" ]] && ls OutputDir/GEOSChem.SpeciesConc.*.nc4 >/dev/null 2>&1; then
-    echo "Reusing existing prior-sim output (${RUNDIR}/.reuse_prior_sim set); skipping GEOS-Chem."
-    cd "${RUNDIR}"; echo "finished prior simulation: ${xstr} (reused existing output)"; exit 0
-fi
 if {UseGCHP}; then
     ./cleanRunDir.sh
     echo "{StartDate} 000000" > cap_restart

@@ -16,20 +16,17 @@
 #   submit_job <SchedulerType> <output_bool> <Memory> <CPUs> <Time> <Partition> <Script> <AdditionalArguments>
 submit_job() {
     if [[ $1 = "slurm" || $1 = "tmux" ]]; then
-        submit_slurm_job "${@:2}" || return $?
+        submit_slurm_job "${@:2}"
     elif [[ $1 = "PBS" ]]; then
-        submit_pbs_job "${@:2}" || return $?
+        submit_pbs_job "${@:2}"
     else
         echo "Scheduler type $1 not recognized."
-        return 1
     fi
 
     # If output was saved, concatenate it to imi_output
     if [[ $2 = "true" ]]; then
-        if [[ -f imi_output.tmp ]]; then
-            cat imi_output.tmp >> ${InversionPath}/imi_output.log
-            rm imi_output.tmp
-        fi
+        cat imi_output.tmp >> ${InversionPath}/imi_output.log
+        rm imi_output.tmp
     fi
 }
 

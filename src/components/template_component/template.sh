@@ -233,16 +233,11 @@ setup_template() {
         -e "s: 'ProdLoss: #'ProdLoss:g" \
         -e "s: 'StateMet: #'StateMet:g" \
         -e "s: 'SpeciesConcMND: #'SpeciesConcMND:g" \
-        -e "s: 'Met_CMFMC: #'Met_CMFMC:g" \
         -e "s: 'Met_PEDGEDRY: #'Met_PEDGEDRY:g" \
         -e "s: 'Met_PFICU: #'Met_PFICU:g" \
         -e "s: 'Met_PFILSAN: #'Met_PFILSAN:g" \
         -e "s: 'Met_PFLCU: #'Met_PFLCU:g" \
         -e "s: 'Met_PFLLSAN: #'Met_PFLLSAN:g" HISTORY.rc
-
-    # Limit diagnostics to the variables required by the satellite operator.
-    sed -i -e "s/'SpeciesConcVV_?ALL?[[:space:]]*'/'SpeciesConcVV_CH4                '/g" \
-        -e "s/'Met_CMFMC[[:space:]]*',[[:space:]]*//g" HISTORY.rc
 
     # If turned on, save out hourly CH4 concentrations to daily files
     # use time-average mode

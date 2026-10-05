@@ -3,7 +3,7 @@
 #SBATCH -N 1
 #SBATCH -c 1
 #SBATCH --mem=2000
-#SBATCH --mail-type=NONE
+#SBATCH --mail-type=END
 #SBATCH -o "imi_output.log"
 
 ## Uncomment to use PBS
@@ -178,14 +178,22 @@ echo "# GEOS-Chem version: ${GEOSCHEM_VERSION}" >>"${RunDirs}/config_${RunName}.
 echo "# TROPOMI/blended processor version(s): ${TROPOMI_PROCESSOR_VERSION}" >>"${RunDirs}/config_${RunName}.yml"
 
 ##=======================================================================
-##  Link the existing TROPOMI data
+##  Download the TROPOMI data
 ##=======================================================================
+# Download TROPOMI or blended dataset from AWS
 satelliteCache=${RunDirs}/satellite_data
 
 if [[ -z "$DataPathObs" ]]; then
-    printf "\nDataPathObs is required for this South America workflow.\n"
-    printf "Set DataPathObs to the existing satellite archive; this setup should not download satellite data.\n"
-    exit 1
+    mkdir -p -v $satelliteCache
+
+    if [[ "$SatelliteProduct" == "BlendedTROPOMI" ]]; then
+        downloadScript=src/utilities/download_blended_TROPOMI.py
+    elif [[ "$SatelliteProduct" == "TROPOMI" ]]; then
+        downloadScript=src/utilities/download_TROPOMI.py
+    else
+        printf "$SatelliteProduct is not currently supported for download"
+    fi
+    submit_job $SchedulerType true $RequestedMemory $RequestedCPUs $RequestedTime $downloadScript $StartDate $EndDate $satelliteCache
 else
     # use existing tropomi data and create a symlink to it
     if [[ ! -L $satelliteCache ]]; then

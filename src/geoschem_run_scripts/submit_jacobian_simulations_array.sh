@@ -12,7 +12,6 @@ if [[ $SchedulerType = "slurm" || $SchedulerType = "tmux" ]]; then
         -p $SchedulerPartition \
         -o imi_output.tmp \
         --open-mode=append \
-        --no-requeue \
         -W run_jacobian_simulations.sh
 elif [[ $SchedulerType = "PBS" ]]; then
     qsub -J {START}-{END}{JOBS} \
