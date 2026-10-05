@@ -2,6 +2,7 @@ import xarray as xr
 import os
 from src.utilities.config_utils import load_config
 
+from src.utilities.config_utils import load_config
 
 def multiply_posteriors(config_path, period_number, base_directory, lognormal):
     """
@@ -34,7 +35,8 @@ def multiply_posteriors(config_path, period_number, base_directory, lognormal):
     sf["ScaleFactor"] = sf["ScaleFactor"] * latest_posterior["ScaleFactor"]
 
     # Ensure good netcdf attributes for HEMCO
-    if config['UseGCHP']:
+    # Detect GCHP vs GCC by which coordinate-name set is present
+    if "lats" in sf.coords or "lats" in sf.dims:
         sf.lats.attrs["units"] = "degrees_north"
         sf.lats.attrs["long_name"] = "Latitude"
         sf.lons.attrs["units"] = "degrees_east"

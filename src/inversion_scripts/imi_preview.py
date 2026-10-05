@@ -21,7 +21,6 @@ from src.inversion_scripts.point_sources import get_point_source_coordinates
 from src.inversion_scripts.utils import (
     sum_total_emissions,
     plot_field,
-    read_and_filter_satellite,
     plot_field_gchp, # note we need to set vmin and vmax to make it proper for all cubic faces
     calculate_superobservation_error,
     species_molar_mass,
@@ -30,6 +29,10 @@ from src.inversion_scripts.utils import (
     get_posterior_emissions,
 )
 from src.utilities.config_utils import load_config
+from src.inversion_scripts.satellite_products import (
+    ObservationRequest,
+    get_satellite_product,
+)
 
 from src.inversion_scripts.classify_TROPOMI_obs_to_CSgrids import (
     latlon_to_cartesian,
@@ -42,7 +45,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 def get_satellite_data(
     file_path, satellite_str, species, xlim, ylim, startdate_np64, enddate_np64,
-    use_water_obs
+    use_water_obs, state_vector_path=None
 ):
     """
     Returns a dict with the lat, lon, xspecies, and albedo_swir observations
@@ -67,27 +70,21 @@ def get_satellite_data(
          satellite_data: dict
             dictionary of the extracted values
     """
-    # satellite data dictionary
-    satellite_data = {"lat": [], "lon": [], species: [], "swir_albedo": [],
-                      "time" : []}
-    
-    # Load the satellite data
-    satellite, sat_ind = read_and_filter_satellite(
-        file_path, satellite_str, startdate_np64, enddate_np64, xlim, ylim,
-        use_water_obs)
-
-    # Loop over observations and archive
-    num_obs = len(sat_ind[0])
-    for k in range(num_obs):
-        lat_idx = sat_ind[0][k]
-        lon_idx = sat_ind[1][k]
-        satellite_data["lat"].append(satellite["latitude"][lat_idx, lon_idx])
-        satellite_data["lon"].append(satellite["longitude"][lat_idx, lon_idx])
-        satellite_data[species].append(satellite[species][lat_idx, lon_idx])
-        satellite_data["swir_albedo"].append(satellite["swir_albedo"][lat_idx, lon_idx])
-        satellite_data["time"].append(satellite["time"][lat_idx, lon_idx])
-
-    return satellite_data
+    request = ObservationRequest(
+        filename=file_path,
+        species=species,
+        start_date=startdate_np64,
+        end_date=enddate_np64,
+        xlim=xlim,
+        ylim=ylim,
+        use_water_observations=use_water_obs,
+        state_vector_path=state_vector_path,
+    )
+    preview = get_satellite_product(satellite_str).preview(request)
+    if preview is not None:
+        # Enforce the product-neutral preview contract at the shared boundary.
+        preview["time"] = pd.to_datetime(preview["time"]).to_list()
+    return preview
 
 
 def imi_preview(
@@ -110,9 +107,10 @@ def imi_preview(
     state_vector_labels = state_vector["StateVector"]
 
     # Identify the last element of the region of interest
-    last_ROI_element = int(
-        np.nanmax(state_vector_labels.values) - config["nBufferClusters"]
-    )
+    last_ROI_element = int(state_vector_labels.isel(
+        lat=slice(config["BufferRings"] + 4, -config["BufferRings"] - 4),
+        lon=slice(config["BufferRings"] + 4, -config["BufferRings"] - 4)
+    ).max())
 
     if config['UseGCHP']:
         basedir = os.path.expandvars(
@@ -661,9 +659,10 @@ def estimate_averaging_kernel(
     state_vector_labels = state_vector["StateVector"]
 
     # Identify the last element of the region of interest
-    last_ROI_element = int(
-        np.nanmax(state_vector_labels.values) - config["nBufferClusters"]
-    )
+    last_ROI_element = int(state_vector_labels.isel(
+        lat=slice(config["BufferRings"] + 4, -config["BufferRings"] - 4),
+        lon=slice(config["BufferRings"] + 4, -config["BufferRings"] - 4)
+    ).max())
 
     # Whether to use observations over water?
     use_water_obs = config["UseWaterObs"] if "UseWaterObs" in config.keys() else False
@@ -694,7 +693,7 @@ def estimate_averaging_kernel(
         # use the nudged (prior) emissions for generating averaging kernel estimate
         sf = xr.load_dataset(f"{rundir_path}archive_sf/prior_sf_period{kf_index}.nc")
         prior_ds = get_mean_emissions(startday, endday, prior_cache)
-        prior_ds = get_posterior_emissions(prior_ds, sf, config["OptimizeSoil"])
+        prior_ds = get_posterior_emissions(prior_ds, sf, config["Species"], config["OptimizeSoil"])
     else:
         prior_ds = get_mean_emissions(startday, endday, prior_cache)
 
@@ -745,17 +744,22 @@ def estimate_averaging_kernel(
         - datetime.timedelta(days=1)
     )
 
-    # Only consider satellite files within date range (in case more are present)
-    satellite_paths = [
-        p
-        for p in satellite_paths
-        if int(p.split("____")[1][0:8]) >= int(startday)
-        and int(p.split("____")[1][0:8]) < int(endday)
-    ]
-    satellite_paths.sort()
-
     # What satellite data product to use?
     satellite_str = config["SatelliteProduct"]
+    satellite_product = get_satellite_product(satellite_str)
+
+    # Only consider satellite files within date range (in case more are present).
+    # Parse each filename once using the selected product's naming convention.
+    dated_satellite_paths = (
+        (satellite_product.observation_date(path), path)
+        for path in satellite_paths
+    )
+    satellite_paths = sorted(
+        path
+        for observation_date, path in dated_satellite_paths
+        if int(observation_date.strftime("%Y%m%d")) >= int(startday)
+        and int(observation_date.strftime("%Y%m%d")) < int(endday)
+    )
 
     # Open satellite files and filter data
     lat = []
@@ -763,6 +767,7 @@ def estimate_averaging_kernel(
     xspecies = []
     albedo = []
     trtime = []
+    observation_count = []
 
     # Read in and filter satellite observations (uses parallel processing)
     observation_dicts = Parallel(n_jobs=-1)(
@@ -774,7 +779,8 @@ def estimate_averaging_kernel(
             ylim, 
             startdate_np64, 
             enddate_np64,
-            use_water_obs
+            use_water_obs,
+            state_vector_path,
         )
         for file_path in satellite_paths
     )
@@ -787,12 +793,13 @@ def estimate_averaging_kernel(
         xspecies.extend(dict[species])
         albedo.extend(dict["swir_albedo"])
         trtime.extend(dict["time"])
+        observation_count.extend(dict["observation_count"])
 
     # Assemble in dataframe
     df = pd.DataFrame()
     df["lat"] = lat
     df["lon"] = lon
-    df["obs_count"] = np.ones(len(lat))
+    df["obs_count"] = observation_count
     df["swir_albedo"] = albedo
     df[species] = xspecies
     df["time"] = trtime

@@ -48,8 +48,8 @@ config_required: Dict[str, Rule] = {
     "LatMax": float,
     "KalmanMode": bool,
     "CreateAutomaticRectilinearStateVectorFile": bool,
-    "nBufferClusters": int,
-    "BufferDeg": float,
+    "BufferRings": int,
+    "BufferReductionFactor": float,
     "EmisThreshold": float,
     "ReducedDimensionStateVector": bool,
     "StateVectorFile": str,
@@ -168,6 +168,8 @@ optional_rules: Dict[str, Rule] = {
     "OffDiagonalObsCovTemporalRho": ANY,          # adjacent-day temporal correlation
     "OffDiagonalObsCovCutoffKm": ANY,             # spatial cutoff (km); default 3*L2
     "UseResidualObsError": bool,                  # use the REM diagonal So file directly
+    "FirstPeriod": int,
+    "AutoAdvanceFirstPeriod": bool,
     # ReducedDimensionStateVector-related
     "ClusteringMethod": str,
     "NumberOfElements": int,

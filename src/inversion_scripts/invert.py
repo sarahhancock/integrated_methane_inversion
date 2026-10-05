@@ -33,6 +33,7 @@ from src.inversion_scripts.so_operator import (
     compute_so_normal_equations,
 )
 from src.utilities.config_utils import load_config
+from src.inversion_scripts.satellite_products import get_satellite_product
 
 
 # Softplus smoothing scale (x = s*log(1+e^{z/s})); 0.1 is near-ReLU and matches production.
@@ -1295,13 +1296,11 @@ if __name__ == "__main__":
         gc_startdate = np.datetime64(datetime.datetime.strptime(str(config['StartDate']), "%Y%m%d"))
         gc_enddate = np.datetime64(datetime.datetime.strptime(str(config['EndDate']), "%Y%m%d"))
         allfiles = glob.glob(f"{jacobian_dir}/*.pkl")
+        satellite_product = get_satellite_product(config["SatelliteProduct"])
         jacobian_files = []
         for index in range(len(allfiles)):
             filename = allfiles[index]
-            shortname = re.split(r"\/", filename)[-1]
-            shortname = re.split(r"\.", shortname)[0]
-            strdate = re.split(r"\.|_+|T", shortname)[4]
-            strdate = datetime.datetime.strptime(strdate, "%Y%m%d")
+            strdate = satellite_product.observation_date(filename)
             if (strdate >= gc_startdate) and (strdate < gc_enddate):
                 jacobian_files.append(filename)
         jacobian_files.sort()

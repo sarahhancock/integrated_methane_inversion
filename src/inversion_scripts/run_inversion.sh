@@ -30,7 +30,7 @@ else
 fi
 
 # Get configuration
-#  This defines $StartDate, $EndDate, $nBufferClusters, $RunName
+#  This defines $StartDate, $EndDate, $RunName
 #  It also define $PriorError, $ObsError, $Gamma, $PrecomputedJacobian
 #  Parsing the config file here facilitates generation of inversion ensembles
 #  All that needs to be done is to edit the config file for $PriorError,
@@ -268,11 +268,11 @@ else
         find "${InvDir}/data_converted" -type f -name '*.pkl' -delete 2>/dev/null || true
         find "${InvDir}/data_visualization" -type f -name '*.pkl' -delete 2>/dev/null || true
     fi
-    python -u ${InvDir}/jacobian.py ${InvDir} ${configPath} $StartDate $EndDate $LonMinInvDomain $LonMaxInvDomain $LatMinInvDomain $LatMaxInvDomain $nElements $Species $satelliteCache $SatelliteProduct $UseWaterObs $isPost $period_i $buildJacobian False; wait
+    python -u ${InvDir}/jacobian.py ${InvDir} ${configPath} $StartDate $EndDate $LonMinInvDomain $LonMaxInvDomain $LatMinInvDomain $LatMaxInvDomain $nElements $satelliteCache $isPost $period_i $buildJacobian False; wait
     if "$LognormalErrors"; then
         # for lognormal error visualization of the prior we sample the prior run
         # without constructing the jacobian matrix
-        python ${InvDir}/jacobian.py ${InvDir} ${configPath} $StartDate $EndDate $LonMinInvDomain $LonMaxInvDomain $LatMinInvDomain $LatMaxInvDomain $nElements $Species $satelliteCache $SatelliteProduct $UseWaterObs $isPost $period_i False True; wait
+        python ${InvDir}/jacobian.py ${InvDir} ${configPath} $StartDate $EndDate $LonMinInvDomain $LonMaxInvDomain $LatMinInvDomain $LatMaxInvDomain $nElements $satelliteCache $isPost $period_i False True; wait
     fi
     printf " DONE -- jacobian.py\n\n"
 

@@ -9,8 +9,9 @@ __pycache__/
 .ipynb_checkpoints/
 slurm-*.out
 *~
-*.log
+*.log*
 .env
+.vscode/
 # HON only
 config.yml
 config.aws.yml
