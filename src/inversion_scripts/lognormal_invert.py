@@ -248,7 +248,7 @@ def lognormal_invert(config, state_vector_filepath, jacobian_sf):
                 "corr_length1_km": float(config.get("OffDiagonalObsCovL1", 26.0)),
                 "corr_amplitude2": float(config.get("OffDiagonalObsCovA2", 0.459)),
                 "corr_length2_km": L2,
-                "corr_cutoff_km": float(config.get("OffDiagonalObsCovCutoffKm", 3.0 * L2)),
+                "corr_cutoff_km": float(config.get("OffDiagonalObsCovCutoffKm", 20000.0)),  # match invert.py: solver-independent So (SA production: NO cutoff)
                 "temporal_rho": float(config.get("OffDiagonalObsCovTemporalRho", 0.17)),
             }
             print("  Off-diagonal So = two-exponential (shared operator, exact day-blocked block-Thomas).")

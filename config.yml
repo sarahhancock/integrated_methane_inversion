@@ -210,7 +210,7 @@ OffDiagonalObsCovL1: 26.0            # Default 26.0 km from Hancock South Americ
 OffDiagonalObsCovA2: 0.459           # Default 0.459 from Hancock South America work
 OffDiagonalObsCovL2: 398.0           # Default 398.0 km from Hancock South America work
 OffDiagonalObsCovTemporalRho: 0.17   # Default 0.17 (empirical adjacent-day obs-error lag-1, Hancock South America work)
-## OffDiagonalObsCovCutoffKm: 1194   # spatial cutoff (km); default = 3 * L2
+## OffDiagonalObsCovCutoffKm: 20000  # spatial cutoff (km); default = 20000 (effectively no cutoff; keep 100% of the two-exp correlation)
 
 ## Setup modules
 ##   Turn on/off different steps in setting up the inversion
