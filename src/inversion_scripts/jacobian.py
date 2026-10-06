@@ -278,7 +278,7 @@ if __name__ == "__main__":
             gc_enddate,
             xlim,
             ylim,
-            use_water_obs.lower() == "true",
+            use_water_obs,
         )
     ]
     skipped_prefilter = len(sat_files) - len(filtered_sat_files)
