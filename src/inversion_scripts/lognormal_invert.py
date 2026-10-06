@@ -155,11 +155,33 @@ def lognormal_invert(config, state_vector_filepath, jacobian_sf):
         int(state_vector_labels.max().item()) + BC_element_num + OH_element_num
     )
 
-    interior = state_vector_labels.isel(
-        lat=slice(config["BufferRings"] + 4, -config["BufferRings"] - 4), 
-        lon=slice(config["BufferRings"] + 4, -config["BufferRings"] - 4)
+    # Number of buffer (non-ROI) state-vector elements. The lognormal transform is applied ONLY to the
+    # region-of-interest elements; the buffers/BC/OH stay linear, so K is split at the ROI count.
+    # Native grid: the buffer is the outer BufferRings (numbered highest), so the count is
+    # max(labels) - max(interior labels), the interior being the ROI with the outer BufferRings+4 cells
+    # removed. Reduced (clustered) state vector: the ROI is clustered but the buffer elements are RETAINED
+    # native cells numbered highest (aggregation.py zero_buffer_elements), so the rectangular slice on the
+    # CLUSTERED grid is unreliable -- derive the buffer count from the NATIVE state vector exactly as
+    # aggregation.py does (nBufferClusters = nStateOrig - last_ROI_element).
+    reduced = str(config.get("ReducedDimensionStateVector", False)).strip().lower() in ("true", "1", "yes")
+    native_sv_path = os.path.join(
+        os.path.expandvars(config["OutputPath"]), str(config["RunName"]), "NativeStateVector.nc"
     )
-    num_buffer_elems = int(state_vector_labels.max().item() - interior.max().item())
+    if reduced and os.path.exists(native_sv_path):
+        native_labels = xr.load_dataset(native_sv_path).squeeze()["StateVector"]
+        native_interior = native_labels.isel(
+            lat=slice(config["BufferRings"] + 4, -config["BufferRings"] - 4),
+            lon=slice(config["BufferRings"] + 4, -config["BufferRings"] - 4),
+        )
+        num_buffer_elems = int(native_labels.max().item() - native_interior.max().item())
+        print(f"  reduced state vector: num_buffer_elems={num_buffer_elems} from NativeStateVector.nc "
+              f"(n_roi={int(state_vector_labels.max().item()) - num_buffer_elems})")
+    else:
+        interior = state_vector_labels.isel(
+            lat=slice(config["BufferRings"] + 4, -config["BufferRings"] - 4),
+            lon=slice(config["BufferRings"] + 4, -config["BufferRings"] - 4),
+        )
+        num_buffer_elems = int(state_vector_labels.max().item() - interior.max().item())
 
     num_normal_elems = num_buffer_elems + BC_element_num + OH_element_num
     ds = np.load("full_jacobian_K.npz")
