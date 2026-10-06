@@ -190,7 +190,10 @@ run_period() {
             nElements_p=$((nElements_p + 2))
         fi
     fi
-    sed -i -E "s|^nElements=.*|nElements=${nElements_p}|" "${RunDirs}/${KalmanInversionSubdir:-kf_inversions}/period${period_i}/run_inversion.sh"
+    # Only refresh the numeric placeholder line (nElements=<int>); do NOT touch run_inversion.sh's
+    # dynamic recompute `nElements=$EmissionElements` (+BC/+OH below it) -- clobbering that to an int
+    # made the subsequent +4 BC / +OH double-count (e.g. 1131 -> 1135 -> 1139), breaking jacobian.py.
+    sed -i -E "s|^nElements=[0-9].*|nElements=${nElements_p}|" "${RunDirs}/${KalmanInversionSubdir:-kf_inversions}/period${period_i}/run_inversion.sh"
     echo "Period ${period_i}: refreshed nElements to ${nElements_p} in run_inversion.sh"
 
     # run jacobian (prior) simulation for the given period.
