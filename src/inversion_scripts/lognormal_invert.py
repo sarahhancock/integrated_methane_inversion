@@ -211,6 +211,54 @@ def lognormal_invert(config, state_vector_filepath, jacobian_sf):
 
     so_dict = np.load("so_super.npz")
 
+    # --- Anchor the forward model to the ACTUAL prior simulation (robustness for reduced/clustered
+    # state vectors). The lognormal forward is XCH4 = ybkg + K@SF, which assumes K@x_A equals the true
+    # prior enhancement (prior_sim - ybkg). On a NATIVE grid that holds, but with ReducedDimensionStateVector
+    # the clustered Jacobian is built with a per-cluster MEDIAN perturbation scale factor (make_perturbation_sf)
+    # while the perturbation is applied per cell, so K@x_A no longer equals the true enhancement (it can be
+    # inflated many-fold for heterogeneous clusters). The analytical solver is immune because it references the
+    # actual prior simulation via prior + K@(SF-1); the lognormal has no such reference and would otherwise
+    # collapse the scale factors to cancel a phantom enhancement. Re-reference it to the real prior sim:
+    #   XCH4 = prior_sim + K@(SF - x_A)  ==  ybkg_eff + K@SF,  ybkg_eff = prior_sim - K@x_A.
+    # prior_sim at the observations is the prior run sampled by the obs operator into data_converted_prior
+    # (row-aligned with the merged K). This is a no-op when K@x_A already equals prior_sim - ybkg (native grid),
+    # so it does not change native or already-consistent runs.
+    try:
+        import glob as _glob, pickle as _pickle
+        _prior_pkls = sorted(_glob.glob("data_converted_prior/*_GCtoSatellite.pkl"))
+        if _prior_pkls:
+            _prior_obs = np.concatenate(
+                [np.asarray(_pickle.load(open(_p, "rb"))["obs_GC"]) for _p in _prior_pkls], axis=0
+            )
+            _prior_sim = _prior_obs[:, 1]
+            # Verify the prior-run samples are row-aligned with the merged K (same granules, same sorted
+            # order + domain filter). obs_metadata.npz carries the merged lon/lat; require an exact match
+            # before anchoring, else skip (safe fall-back to the emission-free background).
+            _aligned = _prior_sim.size == ybkg.size
+            if _aligned and os.path.exists("obs_metadata.npz"):
+                with np.load("obs_metadata.npz", allow_pickle=True) as _md:
+                    _aligned = bool(
+                        np.allclose(_prior_obs[:, 2], np.asarray(_md["lon"], float), atol=1e-4)
+                        and np.allclose(_prior_obs[:, 3], np.asarray(_md["lat"], float), atol=1e-4)
+                    )
+            if _aligned:
+                ntot_cols = K_temp.shape[1]
+                n_roi_cols = ntot_cols - num_normal_elems
+                xa_prior = np.ones(ntot_cols)                      # prior SF: 1 over ROI/buffer/OH
+                bc0 = n_roi_cols + num_buffer_elems                # BC elements are concentration-space (prior 0)
+                xa_prior[bc0 : bc0 + BC_element_num] = 0.0
+                Kx_prior = K_temp @ xa_prior
+                ybkg_eff = _prior_sim - Kx_prior
+                enh_K = float(np.mean(Kx_prior)); enh_true = float(np.mean(_prior_sim - ybkg))
+                print(f"  lognormal anchored to prior simulation: mean K@prior={enh_K:.2f} ppb, "
+                      f"actual prior enhancement={enh_true:.2f} ppb (shift absorbed into background)")
+                ybkg = ybkg_eff
+            else:
+                print(f"  prior-sim anchor skipped: prior samples ({_prior_sim.size}) not row-aligned "
+                      f"with the merged K ({ybkg.size}); using emission-free background directly")
+    except Exception as _e:
+        print(f"  prior-sim anchor skipped ({_e}); using emission-free background directly")
+
     # Calculate the difference between tropomi and the background
     # simulation, which has no emissions
     y_ybkg_diff = y - ybkg
