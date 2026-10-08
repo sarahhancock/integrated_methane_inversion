@@ -152,6 +152,8 @@ optional_rules: Dict[str, Rule] = {
     "PriorErrorBCs": ANY,  # list[float]
     "PriorErrorBufferElements": ANY,  # list[float]
     "PriorErrorOH": ANY,  # list[float]
+    # OffDiagonalPriorCov construction method
+    "PriorCovarianceMethod": ["length_scale", "national_inventory", "sector_ensemble"],
 }
 
 # -------------------- CONDITIONAL REQUIREMENTS -------------------------

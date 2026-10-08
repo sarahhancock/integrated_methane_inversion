@@ -1,0 +1,494 @@
+from __future__ import annotations
+
+"""Sector-ensemble prior error covariance (PriorCovarianceMethod: sector_ensemble).
+
+Builds the full data-driven prior error covariance Sa by summing, in absolute emission^2
+units, three per-sector contributions and then decomposing the result exactly into the
+standard (unit-diagonal correlation, per-element sigma) contract:
+
+  1. Anthropogenic sectors  -> two-component national covariance (national rank-1 set so
+     the per-country aggregate equals the reported inventory uncertainty u_BTR, plus a
+     grid-scale local-diagonal excess). Reused from build_national_inventory_prior_covariance.
+  2. Wetlands               -> ensemble covariance from a wetland model ensemble:
+     diag(sigma_i E_i) exp(-d_ij / L) diag(sigma_j E_j), with a per-cell relative error
+     sigma_i (inter-model spread) mapped onto the state-vector elements and a correlation
+     length L fit from the ensemble variogram.  Enabled by SectorEnsembleWetlandFile.
+  3. Remaining natural sectors -> a generic correlated block
+     diag(sigma E) [exp(-d/L) o S] diag(sigma E) with sigma=0.5 and S the cosine similarity of the
+     cells' sectoral composition, at L = the wetland ensemble length (fallback 200 km, Yu et al. 2021).
+     Each sector also gets a domain-wide Saunois systematic g_s^2 outer(e_s, e_s) so its continental
+     aggregate is floored to the Saunois value (the minor-natural analogue of the wetland floor).
+
+Every block is built in absolute units, summed, divided by outer(E_total, E_total), and
+split exactly into (C, sigma) -- identical output contract to the other prior-covariance
+builders, so invert.py needs no changes.
+
+CLI (matches build_national_inventory_prior_covariance.py):
+  build_sector_ensemble_prior_covariance.py StateVectorFile PriorEmisDir config StartDate EndDate nBufferClusters
+"""
+
+import sys
+
+import numpy as np
+import xarray as xr
+
+try:
+    from src.utilities.config_utils import load_config
+except ModuleNotFoundError:
+    from config_utils import load_config
+
+from utils import ensure_float_list, get_mean_emissions
+
+# reuse the national-inventory builder's helpers (both scripts live in the inversion run dir)
+try:
+    from src.inversion_scripts.build_national_inventory_prior_covariance import (
+        SAUNOIS_GLOBAL_BACKGROUND,
+        append_buffer_elements,
+        build_all_ones_country_mask,
+        build_country_mask_from_shapes,
+        build_saunois_default_table,
+        decompose_relative_covariance,
+        get_sector_fields,
+        load_country_mask,
+        nearest_positive_semidefinite_correlation,
+        read_uncertainty_table,
+        sector_key,
+        select_state_vector_subset,
+        state_vector_ids_and_mask,
+        emission_weighted_element_table,
+        two_component_absolute,
+        default_country_shapefile,
+        domain_invariant_enabled,
+        write_diagnostics,
+    )
+except ModuleNotFoundError:
+    from build_national_inventory_prior_covariance import (
+        SAUNOIS_GLOBAL_BACKGROUND,
+        append_buffer_elements,
+        build_all_ones_country_mask,
+        build_country_mask_from_shapes,
+        build_saunois_default_table,
+        decompose_relative_covariance,
+        get_sector_fields,
+        load_country_mask,
+        nearest_positive_semidefinite_correlation,
+        read_uncertainty_table,
+        sector_key,
+        select_state_vector_subset,
+        state_vector_ids_and_mask,
+        emission_weighted_element_table,
+        two_component_absolute,
+        default_country_shapefile,
+        domain_invariant_enabled,
+        write_diagnostics,
+    )
+
+# Anthropogenic sectors that carry a reported national (BTR) uncertainty and so get the
+# two-component national covariance. Others present in the prior are handled by the wetland
+# ensemble (Wetlands) or the generic block (everything else). Overridable via config.
+DEFAULT_TWO_COMPONENT_SECTORS = [
+    "Livestock", "Rice", "Landfills", "Wastewater", "Coal", "Gas", "Oil", "OtherAnth",
+]
+EARTH_RADIUS_KM = 6371.0
+
+
+def great_circle_matrix(lat, lon):
+    """(n, n) great-circle distance in km between element centroids."""
+    la = np.radians(np.asarray(lat, dtype=np.float64))
+    lo = np.radians(np.asarray(lon, dtype=np.float64))
+    dla = la[:, None] - la[None, :]
+    dlo = lo[:, None] - lo[None, :]
+    a = np.sin(dla / 2.0) ** 2 + np.cos(la)[:, None] * np.cos(la)[None, :] * np.sin(dlo / 2.0) ** 2
+    return 2.0 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+
+
+def element_geometry_and_sector_emissions(state_vector_subset, prior, sector_fields, roi_ids):
+    """Per-element centroid (lat, lon) and per-element per-sector absolute emission.
+
+    Returns (elat, elon, sector_emis) where sector_emis[sector_key] is an (n,) array of
+    that sector's total emission (EmisCH4_field * AREA) summed over the element's cells.
+    """
+    labels = state_vector_subset.values
+    lat2d, lon2d = np.meshgrid(prior.lat.values, prior.lon.values, indexing="ij")
+    area = prior["AREA"].values if "AREA" in prior else np.ones_like(labels, dtype=float)
+    id_to_pos = {int(label): idx for idx, label in enumerate(roi_ids)}
+    n = len(roi_ids)
+    elat = np.zeros(n, dtype=np.float64)
+    elon = np.zeros(n, dtype=np.float64)
+    sector_emis = {sector_key(f): np.zeros(n, dtype=np.float64) for f in sector_fields}
+    weighted = {f: np.asarray(prior[f].values, dtype=np.float64) * area for f in sector_fields}
+    for label in roi_ids:
+        mask = labels == int(label)
+        if not np.any(mask):
+            continue
+        pos = id_to_pos[int(label)]
+        elat[pos] = float(np.mean(lat2d[mask]))
+        elon[pos] = float(np.mean(lon2d[mask]))
+        for f in sector_fields:
+            sector_emis[sector_key(f)][pos] = float(np.nansum(weighted[f][mask]))
+    return elat, elon, sector_emis
+
+
+# Gaussian range-statistic constants d2(N) (Shewhart control-chart / order-statistic table): for N samples
+# from a normal, E[max-min] = d2(N)*sigma, so range/d2(N) is the standard bias-corrected estimate of sigma from
+# the range. A wetland file's 'rel' is stored AS range/d2 (i.e. already the sigma estimate); the optional
+# SectorEnsembleWetlandRawRange instead uses the raw peak-to-peak RANGE by multiplying rel back up by d2(N) --
+# a looser, ~1.7x-inflated choice (NOT an unbiased sigma). N read from the ensemble ('names'/'clim'). d2(3)=1.693.
+_D2_CONST = {2: 1.128, 3: 1.693, 4: 2.059, 5: 2.326, 6: 2.534, 7: 2.704, 8: 2.847, 9: 2.970, 10: 3.078}
+
+
+def load_wetland_ensemble_sigma(path, config, elat, elon, month=None):
+    """Map a gridded wetland ensemble relative error onto the state-vector elements.
+
+    The ensemble file (npz or netCDF) provides a per-cell relative 1-sigma error (inter-model spread;
+    variable SectorEnsembleWetlandVar, default 'rel') on a lat/lon grid, and optionally a scalar
+    correlation length 'L_km'. A 3-D field is (month, lat, lon):
+      * SectorEnsembleWetlandMonthly (default ON) + a 12-month climatology + the period's `month` ->
+        that calendar month's field is used (the seasonal wetland disagreement for the month being solved),
+      * otherwise the field is averaged over months (annual mean).
+    In both cases the non-finite fallback is the ANNUAL-mean grid median (matching compute_table's SIGWET_M).
+    SectorEnsembleWetlandRawRange (default OFF) multiplies by d2(N) to convert stored range/d2 -> raw range.
+    Returns (sigma_per_element, length_km).
+    """
+    var = config.get("SectorEnsembleWetlandVar", "rel")
+    length_km = None
+    n_members = None
+    if str(path).endswith(".npz"):
+        data = np.load(path, allow_pickle=True)
+        if var not in data.files:
+            raise ValueError(f"SectorEnsembleWetlandFile {path} has no variable {var!r}; found {list(data.files)}")
+        rel = np.asarray(data[var], dtype=np.float64)
+        wlat = np.asarray(data["lat"], dtype=np.float64)
+        wlon = np.asarray(data["lon"], dtype=np.float64)
+        if "L_km" in data.files:
+            length_km = float(data["L_km"])
+        if "names" in data.files:
+            n_members = int(np.asarray(data["names"]).size)
+        elif "clim" in data.files:
+            n_members = int(np.asarray(data["clim"]).shape[0])
+    else:
+        ds = xr.open_dataset(path)
+        rel = np.asarray(ds[var].values, dtype=np.float64)
+        wlat = np.asarray(ds["lat"].values, dtype=np.float64)
+        wlon = np.asarray(ds["lon"].values, dtype=np.float64)
+        if "L_km" in ds:
+            length_km = float(ds["L_km"].values)
+        for _cand in ("names", "member", "members", "ensemble", "model"):        # ensemble size for the d2(N) raw-range factor
+            if _cand in getattr(ds, "dims", {}):
+                n_members = int(ds.sizes[_cand]); break
+            if _cand in getattr(ds, "variables", {}):
+                n_members = int(np.asarray(ds[_cand].values).size); break
+
+    wet_mode = "2-D (no month axis)"
+    if rel.ndim == 3:            # (month, lat, lon)
+        annual = np.nanmean(rel, axis=0)                                   # for the non-finite fallback median
+        monthly = str(config.get("SectorEnsembleWetlandMonthly", True)).strip().lower() in ("true", "1", "yes")
+        if monthly and month is not None and rel.shape[0] == 12:
+            rel = rel[int(month) - 1]                                      # this calendar month's climatology
+            wet_mode = f"climatology month {int(month):02d} of 12"
+        else:
+            if monthly and month is not None and rel.shape[0] != 12:
+                print(f"  WARNING: SectorEnsembleWetlandMonthly is ON but the wetland field has {rel.shape[0]} "
+                      f"time slices (not a 12-month climatology) -> falling back to the ANNUAL MEAN. Provide a "
+                      f"12-month climatology for month-specific wetland uncertainty.")
+            elif monthly and month is None:
+                print("  WARNING: SectorEnsembleWetlandMonthly is ON but no period month was resolved from "
+                      "StartDate -> using the ANNUAL MEAN wetland sigma.")
+            rel = annual
+            wet_mode = "annual mean"
+        fallback = float(np.nanmedian(annual[np.isfinite(annual)])) if np.isfinite(annual).any() else 0.5
+    else:
+        fallback = float(np.nanmedian(rel[np.isfinite(rel)])) if np.isfinite(rel).any() else 0.5
+
+    sigma = np.full(len(elat), fallback, dtype=np.float64)
+    for i in range(len(elat)):
+        jlat = int(np.argmin(np.abs(wlat - elat[i])))
+        jlon = int(np.argmin(np.abs(wlon - elon[i])))
+        value = rel[jlat, jlon]
+        if np.isfinite(value):
+            sigma[i] = value
+    # raw-range conversion (range/d2 -> raw range) by d2(N); N from the ensemble, override via WetlandDVal.
+    if str(config.get("SectorEnsembleWetlandRawRange", False)).strip().lower() in ("true", "1", "yes"):
+        _explicit = config.get("SectorEnsembleWetlandDVal")
+        if _explicit is not None:
+            d2 = float(_explicit)
+        elif n_members and n_members in _D2_CONST:
+            d2 = _D2_CONST[n_members]
+        else:
+            d2 = 1.0
+            print(f"  WARNING: SectorEnsembleWetlandRawRange is ON but the ensemble member count could not be "
+                  f"determined from the wetland file (n_members={n_members}) and SectorEnsembleWetlandDVal is "
+                  f"unset -> d2=1.0, so the raw-range scaling is a NO-OP. Set SectorEnsembleWetlandDVal to the "
+                  f"range->sigma factor d2(N) for your ensemble (d2(3)=1.693).")
+        sigma = sigma * d2
+        wet_mode += f" x raw-range d2(N={n_members})={d2:.3f}"
+    scale = float(config.get("SectorEnsembleWetlandSigmaScale", 1.0))
+    floor = float(config.get("SectorEnsembleSigmaFloor", 0.15))
+    cap = float(config.get("SectorEnsembleSigmaCap", 2.0))
+    sigma = np.clip(sigma * scale, floor, cap)
+    length_km = float(config.get("SectorEnsembleWetlandLengthKm", length_km if length_km else 161.0))
+    print(f"  Wetland ensemble sigma: {wet_mode}; median {float(np.median(sigma)):.2f} "
+          f"[{float(sigma.min()):.2f},{float(sigma.max()):.2f}] over {len(elat)} elements.")
+    return sigma, length_km
+
+
+def main(sv_path, prior_emis_dir, config_path, start_date, end_date, nbuffer_elements):
+    config = load_config(config_path)
+    nbuffer_elements = int(nbuffer_elements)
+    prior_sigma = float(ensure_float_list(config["PriorError"])[0])
+
+    prior = get_mean_emissions(start_date, end_date, prior_emis_dir)
+    configured_sector_fields = config.get("NationalPriorSectorFields", None)
+    if configured_sector_fields:
+        missing = [f for f in configured_sector_fields if f not in prior]
+        if missing:
+            raise ValueError(f"Configured sector fields missing from prior: {missing}")
+        prior.attrs["_configured_sector_fields"] = list(configured_sector_fields)
+    sector_fields = get_sector_fields(prior)
+    sector_names = [sector_key(f) for f in sector_fields]
+
+    state_vector = xr.open_dataset(sv_path)
+    if "time" in state_vector.dims:
+        state_vector = state_vector.isel(time=0)
+    state_vector_subset = select_state_vector_subset(state_vector, prior)
+    roi_ids, _ = state_vector_ids_and_mask(state_vector_subset, nbuffer_elements)
+    n = len(roi_ids)
+
+    # ---- national (BTR) uncertainties + country mask, for the two-component anthro block ----
+    uncertainty_path = config.get("NationalPriorUncertaintyFile")
+    country_mask_path = config.get("NationalPriorCountryMaskFile")
+    country_mask_var = config.get("NationalPriorCountryMaskVariable", "country_id")
+    # Fall back to the bundled global shapefile so any IMI user gets per-country masks with no setup.
+    country_shapefile = config.get("NationalPriorCountryShapefile") or default_country_shapefile()
+    if uncertainty_path and not (country_mask_path or country_shapefile):
+        raise ValueError(
+            "NationalPriorUncertaintyFile was set but no country mask was provided. "
+            "Set NationalPriorCountryMaskFile or NationalPriorCountryShapefile, or omit "
+            "NationalPriorUncertaintyFile to use the Saunois global sectoral defaults."
+        )
+    using_global_defaults = not uncertainty_path
+    country_fraction = None
+    if using_global_defaults:
+        print("NationalPriorUncertaintyFile not set; using Saunois et al. global sectoral defaults for the anthro block.")
+        uncertainty_rows = build_saunois_default_table()
+        country_mask = build_all_ones_country_mask(prior)
+    else:
+        uncertainty_rows = read_uncertainty_table(uncertainty_path)
+        if country_mask_path:
+            country_mask = load_country_mask(country_mask_path, country_mask_var)
+        else:
+            country_mask, country_fraction = build_country_mask_from_shapes(uncertainty_rows, prior, config)
+    # DOMAIN-INVARIANT national term (opt-in, default OFF): scale each country's national rank-1 by
+    # 1/f_C^2 (f_C = in-domain emission-area fraction) so a partial country isn't pinned to its whole
+    # national total. Needs the shapefile mask; unchanged for fully-in-domain countries (f_C=1).
+    if not domain_invariant_enabled(config):
+        country_fraction = None
+    elif country_fraction:                                    # non-empty: at least one country matched
+        print(f"Domain-invariant national term ON (f_C emission-based where available): f_C for "
+              f"{len(country_fraction)} countries (min {min(country_fraction.values()):.2f}, "
+              f"max {max(country_fraction.values()):.2f}).")
+
+    # Saunois GLOBAL-BACKGROUND emission fractions f_sector = E_domain / E_global (from the user's HEMCO global
+    # inventories) for the wetland + generic naturals systematic sigma_sys = G * f. Built once and cached; this
+    # is a cache HIT if build_country_mask_from_shapes populated it above, else a fresh sector-only build. An
+    # empty dict (no HEMCO config / scaling disabled) -> f defaults to 1 (unscaled, full-global amplitude) with
+    # a warning, so a missing HEMCO config never crashes the run.
+    try:
+        from src.inversion_scripts.build_global_emission_fractions import emission_fractions_for_config
+    except ModuleNotFoundError:
+        try:
+            from build_global_emission_fractions import emission_fractions_for_config
+        except ModuleNotFoundError:
+            emission_fractions_for_config = None
+    sector_fraction = {}
+    if emission_fractions_for_config is not None:
+        _ef = emission_fractions_for_config(config, prior)
+        if _ef:
+            sector_fraction = _ef.get("sector_fraction") or {}
+    if not sector_fraction:
+        print("WARNING: no emission fractions f_sector available (HEMCO config not resolved or scaling "
+              "disabled); the wetland/generic Saunois background falls back to f=1 (full-global amplitude, "
+              "sigma_sys=G). Set EmissionFractionHemcoConfig to scale it by the domain's emission share.")
+
+    rows, totals_by_element, neff_sum, neff_sumsq = emission_weighted_element_table(
+        state_vector_subset, country_mask, prior, sector_fields, roi_ids
+    )
+
+    # geometry + per-element per-sector emission (for the ensemble / generic blocks)
+    elat, elon, sector_emis = element_geometry_and_sector_emissions(
+        state_vector_subset, prior, sector_fields, roi_ids
+    )
+    dist = great_circle_matrix(elat, elon)
+
+    diagnostics = []
+
+    # ---- (1) anthropogenic two-component national covariance (absolute units) ----
+    two_component_sectors = list(config.get("SectorEnsembleTwoComponentSectors", DEFAULT_TWO_COMPONENT_SECTORS))
+    grid_national_ratio = float(config.get("NationalPriorGridNationalRatio", 2.5))
+    min_uncertainty = float(config.get("NationalPriorMinUncertainty", 0.30))
+    anthro_rows = [r for r in uncertainty_rows if r["sector"] in two_component_sectors]
+    global_background = None
+    if str(config.get("NationalPriorGlobalBackground", True)).strip().lower() in ("true", "1", "yes"):   # default ON
+        global_background = dict(SAUNOIS_GLOBAL_BACKGROUND)                       # genuine Saunois global values
+        global_background.update(config.get("NationalPriorGlobalBackgroundValues", {}) or {})
+        print("Global background (Saunois) ON for anthro: applied as a FLOOR -- adds only where u_BTR < g_s, "
+              "raising each national aggregate to max(u_BTR, g_s); national/local grid structure unchanged.")
+    Sa_abs, tc_diag = two_component_absolute(
+        rows, neff_sum, neff_sumsq, anthro_rows, n, grid_national_ratio, min_uncertainty, global_background,
+        country_fraction=country_fraction,
+    )
+    diagnostics.extend(tc_diag)
+    if not tc_diag:
+        print("WARNING: no (country, sector) anthropogenic groups matched; the anthro block is empty. "
+              "Check country IDs/mask and sector names.")
+
+    # ---- (2) wetland ensemble covariance (absolute units) ----
+    wetland_file = config.get("SectorEnsembleWetlandFile")
+    wetland_handled = False
+    length_w = None                                        # wetland ensemble length, reused by the generic block below
+    if wetland_file and "Wetlands" in sector_emis:
+        # calendar month of the period being built (covariance builders run per-month) -> the wetland
+        # climatology's month-specific uncertainty, matching compute_table's SIGWET_M[month].
+        try:
+            _wet_month = int(str(start_date)[4:6])
+        except Exception:
+            _wet_month = None
+        sigma_w, length_w = load_wetland_ensemble_sigma(wetland_file, config, elat, elon, month=_wet_month)
+        e_w = sector_emis["Wetlands"]
+        we = sigma_w * e_w
+        Cw = np.exp(-dist / length_w)                      # ensemble correlation (161 km)
+        rho_w = 0.0                                        # kept for the diagnostics dict; no longer a floor
+        Sa_abs += np.outer(we, we) * Cw                    # ensemble covariance block (per-cell sigma unchanged)
+        sigma_sys_w = 0.0
+        if str(config.get("SectorEnsembleWetlandGlobalBackground", True)).strip().lower() in ("true", "1", "yes"):   # default ON
+            # Saunois GLOBAL BACKGROUND for wetlands: a fully-correlated, emission-weighted systematic scaled by
+            # the domain's emission SHARE of the global wetland sector,  sigma_sys = G_wet * f_wet,
+            # f_wet = E_domain / E_global.  Sa += (G_wet f_wet)^2 outer(E_wet, E_wet).  Applied globally (f=1)
+            # the continental aggregate == G_wet; over a sub-domain it carries only that domain's share, so the
+            # aggregate = sqrt(genuine^2 + (G_wet f_wet)^2).  This REPLACES the old convex rho-floor that forced
+            # the sub-domain aggregate to the full global G_wet (treating the sub-domain as the whole globe).
+            g_wet = float(config.get("SectorEnsembleWetlandGlobalValue", 0.28))
+            f_wet = float(sector_fraction.get("Wetlands", 1.0))
+            sigma_sys_w = g_wet * f_wet
+            Sa_abs += (sigma_sys_w * sigma_sys_w) * np.outer(e_w, e_w)
+            E_wet = float(e_w.sum())
+            gen = (np.sqrt(max(float(we @ Cw @ we), 0.0)) / E_wet) if E_wet > 0 else 0.0
+            print(f"Wetland Saunois background ON: G_wet={g_wet:.2f} x f_wet={f_wet:.3f} -> sigma_sys={sigma_sys_w:.3f}; "
+                  f"continental aggregate {gen:.3f} -> {np.sqrt(gen*gen + sigma_sys_w*sigma_sys_w):.3f} "
+                  f"(per-cell sigma unchanged).")
+        wetland_handled = True
+        pos = e_w > 0
+        diagnostics.append({
+            "sector": "Wetlands", "status": "ok", "method": "ensemble",
+            "length_km": length_w, "rho_global": rho_w, "saunois_sigma_sys": float(sigma_sys_w),
+            "sigma_median": float(np.median(sigma_w[pos])) if pos.any() else 0.0,
+            "n_elements": int(pos.sum()),
+        })
+        print(f"Wetland ensemble covariance: L={length_w:.0f} km, "
+              f"sigma median={np.median(sigma_w[pos]) if pos.any() else 0:.2f} over {int(pos.sum())} elements.")
+    elif "Wetlands" in sector_emis:
+        print("SectorEnsembleWetlandFile not set; Wetlands folded into the generic correlated block.")
+
+    # ---- (3) generic correlated block for remaining sectors (naturals) ----
+    # A sector listed as two-component but with no reported (BTR) uncertainty is not pinned by
+    # block (1), so fall it back to the generic block here rather than leave it unconstrained.
+    two_component_covered = {r["sector"] for r in anthro_rows}
+    fallback_to_generic = [
+        s for s in two_component_sectors
+        if s not in two_component_covered and s in sector_emis
+    ]
+    if fallback_to_generic:
+        print(f"WARNING: sector(s) {fallback_to_generic} were requested for the two-component (BTR) prior "
+              f"via SectorEnsembleTwoComponentSectors but have no reported national uncertainty in "
+              f"NationalPriorUncertaintyFile; they fall back to the generic correlated block. Add rows for "
+              f"them to NationalPriorUncertaintyFile to give them the BTR two-component covariance instead.")
+    generic_default = [
+        s for s in sector_names
+        if s not in two_component_covered and not (s == "Wetlands" and wetland_handled)
+    ]
+    generic_sectors = list(config.get("SectorEnsembleGenericSectors", generic_default))
+    generic_sectors = [s for s in generic_sectors if s in sector_emis]
+    if generic_sectors:
+        generic_sigma = float(config.get("SectorEnsembleGenericSigma", 0.5))
+        # Length: reuse the wetland ensemble's fitted length by default -- one consistent, data-derived
+        # length for all the naturals; fall back to 200 km (Yu et al. 2021) only when there is no wetland file.
+        generic_length = float(config.get("SectorEnsembleGenericLengthKm",
+                                          length_w if (wetland_handled and length_w) else 200.0))
+        comp = np.stack([sector_emis[s] for s in generic_sectors], axis=1)   # (n, n_generic)
+        e_non = comp.sum(axis=1)
+        norm = np.linalg.norm(comp, axis=1)
+        unit = np.zeros_like(comp)
+        nz = norm > 0
+        unit[nz] = comp[nz] / norm[nz, None]
+        similarity = unit @ unit.T                                          # cosine similarity (PSD)
+        sb = generic_sigma * e_non
+        K_gen = np.exp(-dist / generic_length) * similarity                 # the generic block's kernel (K o S)
+        Sa_abs += np.outer(sb, sb) * K_gen
+        # Saunois GLOBAL BACKGROUND for the minor naturals -- the analogue of the wetland systematic. Each
+        # sector gets a domain-wide, fully-correlated systematic c_s * outer(e_s, e_s) with amplitude scaled by
+        # the domain's emission SHARE of that global sector:  sqrt(c_s) = sigma_sys = G_s * f_s,
+        # f_s = E_domain / E_global (from the user's HEMCO global inventories).  Applied globally (f=1) the
+        # sector's continental aggregate == G_s; over a sub-domain it carries only that share, so the aggregate
+        # = sqrt(genuine^2 + (G_s f_s)^2).  This REPLACES the old deficit-peel (c_s = G_s^2 - local_var/E^2) that
+        # forced the sub-domain aggregate to the full global G_s.  G_s defaults to SAUNOIS_GLOBAL_BACKGROUND.
+        gbg = None
+        if str(config.get("SectorEnsembleGenericGlobalBackground", True)).strip().lower() in ("true", "1", "yes"):   # default ON
+            gbg = dict(SAUNOIS_GLOBAL_BACKGROUND)
+            gbg.update(config.get("SectorEnsembleGenericGlobalBackgroundValues", {}) or {})
+            _sys_by_sector = {}
+            for s in generic_sectors:
+                g = float(gbg.get(s, 0.0)); es = sector_emis[s]; Es = float(es.sum())
+                if g <= 0.0 or Es <= 0.0:
+                    continue
+                f_s = float(sector_fraction.get(s, 1.0))                                 # domain emission share of global sector s
+                sigma_sys = g * f_s                                                      # sigma_sys = G_s * f_s
+                _sys_by_sector[s] = sigma_sys
+                Sa_abs += (sigma_sys * sigma_sys) * np.outer(es, es)                     # additive fully-correlated systematic
+            if _sys_by_sector:
+                print("GENERIC Saunois background sqrt(c)=G_s*f_s: "
+                      + ", ".join(f"{s}={_sys_by_sector[s]:.3f}" for s in sorted(_sys_by_sector)))
+        for s in generic_sectors:                                           # per-sector diagnostics
+            es = sector_emis[s]
+            diagnostics.append({
+                "sector": s, "status": "ok", "method": "generic",
+                "length_km": generic_length, "sigma": generic_sigma,
+                "global_background": float(gbg.get(s, 0.0)) if gbg is not None else 0.0,
+                "saunois_sigma_sys": float(gbg.get(s, 0.0)) * float(sector_fraction.get(s, 1.0)) if gbg is not None else 0.0,
+                "emission_fraction": float(sector_fraction.get(s, 1.0)),
+                "n_elements": int((es > 0).sum()),
+            })
+        print(f"Generic correlated block: sectors={generic_sectors}, sigma={generic_sigma}, "
+              f"L={generic_length:.0f} km, Saunois background={'on (sigma_sys=G*f)' if gbg is not None else 'off'}.")
+
+    # ---- decompose to (correlation, sigma), PSD-repair, append buffer, write ----
+    covariance, sigma_vector = decompose_relative_covariance(Sa_abs, totals_by_element, prior_sigma)
+    covariance, min_eig_before, min_eig_after = nearest_positive_semidefinite_correlation(covariance)
+    state_vector_ids, covariance = append_buffer_elements(roi_ids, covariance, nbuffer_elements)
+    sigma_scale = np.concatenate(
+        [sigma_vector / prior_sigma, np.ones(nbuffer_elements)]
+    ).astype(np.float32)
+
+    np.savez(
+        "prior_norm_error_covariance.npz",
+        covariance=covariance.astype(np.float32),
+        state_vector_ids=state_vector_ids.astype(np.int32),
+        sigma_scale=sigma_scale,
+    )
+    write_diagnostics("sector_ensemble_prior_covariance_diagnostics.csv", diagnostics)
+    print(
+        f"Wrote sector-ensemble prior covariance with shape {covariance.shape}; "
+        f"anthro groups={len(tc_diag)}; wetland_ensemble={wetland_handled}; "
+        f"generic_sectors={len(generic_sectors)}; "
+        f"min_eig_before={min_eig_before:.3e}; min_eig_after={min_eig_after:.3e}"
+    )
+
+
+if __name__ == "__main__":
+    main(
+        sv_path=sys.argv[1],
+        prior_emis_dir=sys.argv[2],
+        config_path=sys.argv[3],
+        start_date=sys.argv[4],
+        end_date=sys.argv[5],
+        nbuffer_elements=int(sys.argv[6]),
+    )

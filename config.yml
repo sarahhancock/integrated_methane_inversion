@@ -138,6 +138,26 @@ Gamma: [1.0]
 PrecomputedJacobian: false
 OffDiagonalPriorCov: false
 LengthScalePriorCov: 25  ## in km, only used if OffDiagonalPriorCov is true
+## PriorCovarianceMethod selects how the correlated Sa is built when OffDiagonalPriorCov is true:
+##   length_scale (default)  spatial decay x emission-sector cosine similarity (Balasus et al. 2026)
+##   national_inventory      two-component: a national rank-1 (fully-correlated aggregate) term plus a
+##                           local diagonal excess, calibrated so each country-sector aggregate matches
+##                           a supplied relative uncertainty. Needs NationalPriorUncertaintyFile and a
+##                           country mask (NationalPriorCountryMaskFile or NationalPriorCountryShapefile).
+##   sector_ensemble         national_inventory anthro + a wetland model-ensemble block
+##                           (SectorEnsembleWetlandFile) + a generic correlated-naturals block.
+PriorCovarianceMethod: length_scale
+## Keys for national_inventory / sector_ensemble (only read for those methods):
+##   NationalPriorUncertaintyFile: "/path/to/uncertainties.csv"  # columns: iso3, sector, relative_uncertainty
+##   NationalPriorCountryMaskFile: "/path/mask.nc" ; NationalPriorCountryMaskVariable: "country_id"
+##   NationalPriorCountryShapefile: "/path/countries.shp" ; NationalPriorCountryNameColumn: "ISO3"  # alt. to a mask
+##   NationalPriorGridNationalRatio: 2.5   # local/national uncertainty ratio
+##   NationalPriorMinUncertainty: 0.30     # floor on each aggregate relative uncertainty
+##   SectorEnsembleWetlandFile: "/path/wetland_ensemble_cov.npz"  # per-cell relative error on lat/lon (+ optional L_km)
+##   SectorEnsembleWetlandLengthKm: 161 ; SectorEnsembleGenericSigma: 0.5 ; SectorEnsembleGenericLengthKm: 200
+## Optional Saunois global-background floor (a domain-wide per-sector systematic term so large-area
+## aggregates are not driven unrealistically small). Default on for the two methods above; set false to disable:
+##   NationalPriorGlobalBackground: true ; SectorEnsembleWetlandGlobalBackground: true
 UseGOOPy: true ## only turn off GOOPy if it's not yet compatible with your IMI configuration; this should not be necessary for most users
 
 ## Setup modules

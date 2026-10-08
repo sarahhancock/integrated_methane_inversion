@@ -124,11 +124,24 @@ if "$EnableOSSE"; then
 fi
 
 #=======================================================================
-# Optionally build prior error covariance matrix with off-diagonal 
-# elements based on specified length scale
+# Optionally build an off-diagonal prior error covariance matrix. The
+# PriorCovarianceMethod config key selects the construction:
+#   length_scale (default) - spatial decay x emission-sector cosine similarity
+#   national_inventory     - two-component (national rank-1 + local diagonal
+#                            excess) from per-country-sector uncertainties
+#   sector_ensemble        - national_inventory anthro + wetland model-ensemble
+#                            + generic correlated naturals
 #=======================================================================
 if "$OffDiagonalPriorCov"; then
-    python build_full_prior_covariance.py $StateVectorFile $PriorEmisDir $LengthScalePriorCov $StartDate $EndDate $nBufferClusters; wait
+    PriorCovConfig="${OutputPath}/${RunName}/config_${RunName}.yml"
+    PriorCovarianceMethod="${PriorCovarianceMethod:-length_scale}"
+    if [[ "$PriorCovarianceMethod" == "national_inventory" ]]; then
+        python build_national_inventory_prior_covariance.py $StateVectorFile $PriorEmisDir $PriorCovConfig $StartDate $EndDate $nBufferClusters; wait
+    elif [[ "$PriorCovarianceMethod" == "sector_ensemble" ]]; then
+        python build_sector_ensemble_prior_covariance.py $StateVectorFile $PriorEmisDir $PriorCovConfig $StartDate $EndDate $nBufferClusters; wait
+    else
+        python build_full_prior_covariance.py $StateVectorFile $PriorEmisDir $LengthScalePriorCov $StartDate $EndDate $nBufferClusters; wait
+    fi
 fi
 
 #=======================================================================
