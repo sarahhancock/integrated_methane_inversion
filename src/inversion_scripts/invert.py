@@ -38,17 +38,18 @@ from src.inversion_scripts.satellite_products import get_satellite_product
 
 # Softplus smoothing scale (x = s*log(1+e^{z/s})); 0.1 is near-ReLU and matches production.
 SOFTPLUS_SCALE_DEFAULT = 0.1
-# Levenberg-Marquardt damping for the positivity solvers (Chen et al., 2022).
+# Levenberg-Marquardt damping for the positivity-constrained normal solves (Chen et al., 2022).
 POSITIVITY_KAPPA = 10.0
 
 
 def resolve_inversion_method(config):
     """Resolve the analytical-path inversion solver from config.
 
-    `SoftplusErrors: true` is the documented flag that selects the softplus positivity solver
-    (parallel to `LognormalErrors: true`). `InversionMethod: softplus` is still honored for
-    back-compat. Returns "analytical" (default) or "softplus". Lognormal is handled separately
-    via `LognormalErrors` in run_inversion.sh before invert.py is called.
+    `SoftplusErrors: true` is the documented flag that enables the softplus positivity constraint
+    on the normal (Gaussian) inversion (parallel to `LognormalErrors: true`). `InversionMethod:
+    softplus` is still honored for back-compat. Returns "analytical" (default) or "softplus"
+    (the latter being the normal inversion with the softplus positivity constraint). Lognormal is
+    handled separately via `LognormalErrors` in run_inversion.sh before invert.py is called.
     """
     method = str(config.get("InversionMethod", "analytical"))
     if bool(config.get("SoftplusErrors", False)):
@@ -319,18 +320,22 @@ def solve_inversion_from_k(
             delta_optimized, KTinvSoK, KTinvSoyKxA, ytinvSoy, inv_Sa, gamma, n_obs, scale_factor_idx
         )
     elif method == "softplus":
+        # Same normal (Gaussian) inversion as the analytical path above, but with positivity
+        # enforced by a smooth softplus constraint on the region-of-interest emission elements
+        # (BC/OH stay linear). It reuses the same assembled normal-equation products and is solved
+        # by Levenberg-Marquardt; this is not a separate solver, just the constrained normal solve.
         xhat, delta_optimized, S_post, A, diagnostics, n_iter = run_softplus(
             KTinvSoK, KTinvSoyKxA, ytinvSoy, inv_Sa, inv_Sa_constraint,
             n_obs, scale_factor_idx, xa,
             scale=softplus_scale, gamma=gamma, kappa=POSITIVITY_KAPPA,
         )
         Ja_normalized = diagnostics["J_A"] / n_elements
-        print(f"softplus positivity solver converged in {n_iter} iterations")
+        print(f"normal inversion (softplus positivity constraint) converged in {n_iter} iterations")
     else:
         raise ValueError(
             f"Unsupported InversionMethod={inversion_method!r}. "
-            "Use the analytical (default) solver, set SoftplusErrors: true for the softplus "
-            "positivity solver, or LognormalErrors: true for lognormal errors."
+            "Use the analytical (default) normal inversion, set SoftplusErrors: true to enforce "
+            "positivity on it via the softplus constraint, or LognormalErrors: true for lognormal errors."
         )
 
     print(
@@ -1165,8 +1170,8 @@ if __name__ == "__main__":
     obs_err = ensure_float_list(config["ObsError"])
     gamma = ensure_float_list(config["Gamma"])
     # Solver selection. `SoftplusErrors: true` is the documented flag (parallel to
-    # `LognormalErrors: true`) that turns on the softplus positivity solver;
-    # `InversionMethod: softplus` remains honored for back-compat.
+    # `LognormalErrors: true`) that enforces positivity on the normal (Gaussian) inversion
+    # via the softplus constraint; `InversionMethod: softplus` remains honored for back-compat.
     inversion_method = resolve_inversion_method(config)
     softplus_scale = float(config.get("SoftplusScale", SOFTPLUS_SCALE_DEFAULT))
     # NOTE: MaxScaleFactor / MaxTrueScaleFactor are read and threaded but not currently
@@ -1206,7 +1211,7 @@ if __name__ == "__main__":
             # scaling, no double-count. This scales the leading emission/buffer columns; the trailing
             # BC and OH columns are left unscaled, matching the day-level precomputed path. Running the
             # merged path (rather than raising) lets a precomputed-Jacobian re-run use the off-diagonal
-            # So and the softplus/lognormal solvers.
+            # So and the softplus/lognormal positivity constraints.
             scale_factors = np.load(jacobian_sf)
             K = apply_precomputed_sf_to_merged_k(K, scale_factors)
             print(f"PrecomputedJacobian: scaled {np.asarray(scale_factors).size} emission/buffer columns "
@@ -1278,8 +1283,9 @@ if __name__ == "__main__":
     else:
         # Day-level streaming fallback: reached only when NO merged monthly products were found for this
         # period. Reads observations day by day and accumulates K^T So^-1 K without holding them all at
-        # once. It solves the standard analytical (normal) inversion only; the softplus/lognormal solvers
-        # and the off-diagonal So need the merged products (they operate on the full assembled system).
+        # once. It solves the normal (Gaussian) inversion without a positivity constraint; the softplus
+        # and lognormal positivity constraints and the off-diagonal So need the merged products (they
+        # operate on the full assembled system).
         if use_offdiag_so:
             raise RuntimeError(
                 "OffDiagonalObsCov=true requires the merged monthly inversion products (K/y/So with "

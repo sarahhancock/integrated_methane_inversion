@@ -1,8 +1,10 @@
-"""Softplus positivity solver for the IMI analytical inversion.
+"""Normal (Gaussian) IMI inversion with positivity enforced by a softplus constraint.
 
-The softplus transform maps an unconstrained state z to strictly positive emission
-scale factors, so the posterior emissions stay non-negative without a log-barrier
-or a bounded quadratic program:
+This is the standard normal (Gaussian) analytical inversion; the one change is that the
+region-of-interest emission elements are reparametrized through a smooth softplus transform,
+so the posterior emissions stay strictly positive.  The softplus transform maps an
+unconstrained state z to those positive emission scale factors, enforcing non-negativity
+without a log-barrier or a bounded quadratic program:
 
     x = s * log(1 + e^{z/s})     (smooth, and linear for large z)
 
@@ -107,7 +109,7 @@ def inversion_diagnostics(delta, KTinvSoK, KTinvSoy, ytinvSoy, inv_Sa, gamma, n_
 
 
 # --------------------------------------------------------------------------- #
-# Softplus solver
+# Normal (Gaussian) inversion with the softplus positivity constraint
 # --------------------------------------------------------------------------- #
 def run_softplus(
     KTinvSoK,
@@ -128,7 +130,7 @@ def run_softplus(
     tol=5e-3,
     return_state=False,
 ):
-    """Softplus-positivity inversion in normal-equation (KTinvSoK, KTinvSoy) space.
+    """Normal (Gaussian) inversion with an enforced-positivity softplus constraint, in normal-equation (KTinvSoK, KTinvSoy) space.
 
     Arguments
       KTinvSoK, KTinvSoy, ytinvSoy : pre-assembled normal-equation products.
@@ -204,7 +206,7 @@ def run_softplus(
         if it > 0 and step < tol and var_change < tol:
             break
         if max_iter is not None and n_iter >= max_iter:
-            print(f"WARNING: softplus solver did not converge in {max_iter} iterations "
+            print(f"WARNING: softplus-constrained normal inversion did not converge in {max_iter} iterations "
                   f"(step={step:.2e}, var_change={var_change:.2e}, tol={tol:.1e}); "
                   f"returning the current iterate.")
             break
